@@ -394,6 +394,68 @@ def test_road_sample_point_index_near_tie_follows_hypot_ranking():
     assert actual_dist == expected_dist
 
 
+def test_road_sample_point_index_matches_math_hypot_at_map_scale():
+    """np.hypot and math.hypot can disagree by an ulp; math.hypot must win.
+
+    At map-frame coordinates (UTM-sized, ~1e5-1e6 m) libm's ``np.hypot``
+    rounds this pair to the same distance while CPython's ``math.hypot`` —
+    the value the sequential scan compared — finds the second road strictly
+    nearer.  A ranking taken straight from ``np.hypot`` would keep the first
+    road on the tie.
+    """
+    query = (354211.7, 5412345.3)
+    first = (354211.1681355975, 5412340.328368451)
+    second = (354212.242543206, 5412340.329522471)
+
+    assert math.hypot(query[0] - second[0], query[1] - second[1]) < math.hypot(
+        query[0] - first[0], query[1] - first[1]
+    )
+
+    roads = [
+        _make_mock_point_road(road_id=0, wx=first[0], wy=first[1]),
+        _make_mock_point_road(road_id=1, wx=second[0], wy=second[1]),
+    ]
+
+    expected_road, expected_dist = _sequential_nearest_road(query, roads)
+    assert expected_road is roads[1]
+
+    actual_road, actual_dist = RoadSamplePointIndex(roads).nearest(*query)
+
+    assert actual_road is expected_road
+    assert actual_dist == expected_dist
+
+
+def test_road_sample_point_index_infinite_query_reports_infinity():
+    """An infinite query never beats ``inf`` in the scan, so nothing matches."""
+    roads = [_make_mock_point_road(road_id=0, wx=0.0, wy=0.0)]
+
+    assert _sequential_nearest_road((float("inf"), 0.0), roads) == (
+        None,
+        float("inf"),
+    )
+    assert RoadSamplePointIndex(roads).nearest(float("inf"), 0.0) == (
+        None,
+        float("inf"),
+    )
+
+
+def test_road_sample_point_index_skips_nan_and_infinite_samples():
+    """NaN and infinite sample points both lose to a finite one."""
+    roads = [
+        _make_mock_point_road(road_id=0, wx=float("nan"), wy=0.0),
+        _make_mock_point_road(road_id=1, wx=float("inf"), wy=0.0),
+        _make_mock_point_road(road_id=2, wx=6.0, wy=8.0),
+    ]
+
+    expected_road, expected_dist = _sequential_nearest_road((0.0, 0.0), roads)
+    assert expected_road is roads[2]
+
+    actual_road, actual_dist = RoadSamplePointIndex(roads).nearest(0.0, 0.0)
+
+    assert actual_road is roads[2]
+    assert actual_dist == expected_dist == 10.0
+
+
 def test_road_sample_point_index_ignores_nan_sample_points():
     """A road sampled to NaN must lose to a real one, as in the old scan."""
     nan_road = _make_mock_point_road(road_id=0, wx=float("nan"), wy=float("nan"))
