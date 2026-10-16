@@ -11,6 +11,7 @@ import lanelet2
 import lxml.etree as ET
 import numpy as np
 
+from ..config import DEFAULT_CONFIG
 from ..util import extract_points
 from .geometry import Arc, ParamPoly3, evaluate_plan_view_world
 
@@ -270,9 +271,13 @@ class RoadSamplePointIndex:
 
     The flattening preserves the exact iteration order of the original nested
     scan (``for road in all_roads`` then ``for point in
-    _sample_road_points(road)``).  ``np.argmin`` returns the first occurrence
-    of the minimum, so it selects the same sample point that the sequential
-    ``dist < best_dist`` scan kept, ties included.
+    _sample_road_points(road)``).  Distances are first ranked with
+    ``np.hypot``, which can differ from ``math.hypot`` by about one ulp, so
+    every candidate within a few ulps of the vectorised minimum is re-ranked
+    in index order with ``math.hypot`` and a strict ``<`` — exactly the value
+    and comparison the sequential ``dist < best_dist`` scan used.  The index
+    therefore selects the sample point that scan kept: exact ties, near-ties,
+    NaN and infinite coordinates included.
 
     Sampling is deferred until the first query so that a map with neither
     crosswalks nor stop lines pays nothing, just as the per-object scan did.
@@ -334,29 +339,59 @@ class RoadSamplePointIndex:
 
         Returns:
             ``(road, distance)`` for the closest sample point, or
-            ``(None, inf)`` when no road contributed a sample point — the
-            state the sequential scan ended in for that case.
+            ``(None, inf)`` when no road contributed a sample point and when
+            every distance is NaN — the states the sequential scan ended in
+            for those cases.
         """
         xs, ys, road_slots = self._sampled()
         if xs.size == 0:
             return None, float("inf")
 
-        # Squared distance is monotone in distance, so it ranks the points
-        # identically while skipping a sqrt per point.  Squared in place to
-        # keep only two temporaries alive at peak.
+        # Ranked with hypot rather than dx**2 + dy**2: squaring is monotone in
+        # exact arithmetic but rounds differently, so two candidates whose
+        # distances differ only in the last bits can swap order.  Objects sit
+        # near road ends, where consecutive roads share an endpoint, so those
+        # near-ties decide which road an object lands on.  Written into ``dx``
+        # to keep only two temporaries alive at peak.
         dx = xs - x
-        np.square(dx, out=dx)
         dy = ys - y
-        np.square(dy, out=dy)
-        dx += dy
+        np.hypot(dx, dy, out=dx)
 
-        winner = int(np.argmin(dx))
-        road = self._roads[int(road_slots[winner])]
-        # Recompute the winning distance with math.hypot so the threshold
-        # comparison and the warning text see the same value the per-point
-        # scan produced.
-        best_dist = math.hypot(x - float(xs[winner]), y - float(ys[winner]))
-        return road, best_dist
+        # NaN must never win: ``np.argmin`` would return a NaN's index.  The
+        # sequential scan could not keep a NaN, because ``NaN < best_dist`` is
+        # always False, so NaN distances are pushed to +inf before ranking.
+        nan_mask = np.isnan(dx)
+        if bool(nan_mask.all()):
+            return None, float("inf")
+        dx[nan_mask] = np.inf
+
+        coarse_min = float(dx[int(np.argmin(dx))])
+        # An infinite minimum means the scan never accepted any point
+        # (``inf < inf`` is False), so it ended at (None, inf).
+        if not math.isfinite(coarse_min):
+            return None, float("inf")
+
+        # ``np.hypot`` (libm) and ``math.hypot`` (CPython) may disagree by
+        # about one ulp, which is enough to swap a near-tie.  Re-rank every
+        # candidate inside a few-ulp band above the coarse minimum, in index
+        # order, with the scan's own value and strict ``<``.
+        band = coarse_min * (
+            1.0
+            + DEFAULT_CONFIG.geometry.nearest_road_rerank_ulps
+            * float(np.finfo(np.float64).eps)
+        )
+        best_dist = float("inf")
+        winner = -1
+        for candidate in np.flatnonzero(dx <= band):
+            idx = int(candidate)
+            dist = math.hypot(x - float(xs[idx]), y - float(ys[idx]))
+            if dist < best_dist:
+                best_dist = dist
+                winner = idx
+        if winner < 0:
+            return None, float("inf")
+
+        return self._roads[int(road_slots[winner])], best_dist
 
 
 def _nearest_road_to_point(
@@ -382,7 +417,8 @@ def _nearest_road_to_point(
     index = road_index if road_index is not None else RoadSamplePointIndex(all_roads)
     best_road, best_dist = index.nearest(float(centroid[0]), float(centroid[1]))
 
-    if best_dist > threshold_m:
+    # ``not isfinite`` also rejects NaN, for which ``> threshold_m`` is False.
+    if not math.isfinite(best_dist) or best_dist > threshold_m:
         logger.warning(
             f"{label}: nearest road is {best_dist:.1f}m away "
             f"(threshold={threshold_m}m), skipping"

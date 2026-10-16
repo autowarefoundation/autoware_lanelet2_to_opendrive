@@ -28,6 +28,12 @@ class GeometryConstants:
             ``type=curbstone`` or ``type=road_border``. Both ``inner`` and
             ``outer`` of the emitted ``<height>`` are set to this value, so
             the sidewalk surface sits flat on top of the curb. Issue #469.
+        nearest_road_rerank_ulps: Relative width, in units of float64
+            machine epsilon, of the band above the vectorised minimum distance
+            whose candidates the nearest-road index re-ranks with
+            ``math.hypot``. ``np.hypot`` (libm) and ``math.hypot`` (CPython)
+            may disagree by about one ulp, so every candidate that could be
+            the ``math.hypot`` minimum lies inside this band.
     """
 
     epsilon: float = 1e-10
@@ -36,6 +42,7 @@ class GeometryConstants:
     divergence_min_segment_length: float = 0.01
     divergence_default_lane_width: float = 3.5
     sidewalk_height: float = 0.15
+    nearest_road_rerank_ulps: float = 8.0
 
 
 @dataclass(frozen=True)
