@@ -20,6 +20,7 @@ from autoware_lanelet2_to_opendrive.projection import (
     latlon_to_proj_string,
     mgrs_grid_with_offset_to_proj_string,
     mgrs_to_proj_string,
+    parse_mgrs_frame_proj_string,
 )
 from autoware_lanelet2_to_opendrive.projection_resolver import (
     resolve_projection_from_hydra,
@@ -184,3 +185,44 @@ def test_full_precision_grid_anchors_at_grid_square_corner():
     assert mgrs_grid_with_offset_to_proj_string(
         "54SUE1234567890", 81655.73, 50137.43
     ) == mgrs_grid_with_offset_to_proj_string("54SUE", 81655.73, 50137.43)
+
+
+@pytest.mark.parametrize(
+    "grid, offset_x, offset_y",
+    [
+        (TOKYO_GRID, 81655.73, 50137.43),
+        (TOKYO_GRID, 0.0, 0.0),
+        (SYDNEY_GRID, 12345.67, 89012.34),
+    ],
+)
+def test_parse_mgrs_frame_proj_string_inverts_geo_reference(grid, offset_x, offset_y):
+    """The parsed frame origin is the inverse projection of output (0, 0),
+    and its offset is the one folded into the geoReference."""
+    proj_string = mgrs_grid_with_offset_to_proj_string(grid, offset_x, offset_y)
+    frame = parse_mgrs_frame_proj_string(proj_string)
+    assert frame is not None
+    assert frame.offset_x == pytest.approx(offset_x, abs=1e-6)
+    assert frame.offset_y == pytest.approx(offset_y, abs=1e-6)
+
+    inverse = Transformer.from_crs(proj_string, "EPSG:4326", always_xy=True)
+    lon, lat = inverse.transform(0.0, 0.0)
+    # Frame lat/lon carry 1 m MGRS precision (~1e-5 deg).
+    assert frame.latitude == pytest.approx(lat, abs=2e-5)
+    assert frame.longitude == pytest.approx(lon, abs=2e-5)
+
+
+@pytest.mark.parametrize(
+    "proj_string",
+    [
+        # TransverseMercator geoReference: lat_0/lon_0 is the real origin.
+        "+proj=tmerc +lat_0=35.68 +lon_0=139.69 +k_0=0.9999 +x_0=0 +y_0=0 "
+        "+datum=WGS84 +units=m +no_defs",
+        # Pre-#550 UTM geoReference.
+        "+proj=utm +zone=54 +lat_0=35.68 +lon_0=139.69 +datum=WGS84 +units=m +no_defs",
+        # tmerc with a non-UTM central meridian is not an MGRS frame.
+        "+proj=tmerc +lat_0=0 +lon_0=139.69 +k_0=0.9996 +x_0=1000 +y_0=-1000 "
+        "+datum=WGS84 +units=m +no_defs",
+    ],
+)
+def test_parse_mgrs_frame_proj_string_rejects_real_origin_strings(proj_string):
+    assert parse_mgrs_frame_proj_string(proj_string) is None

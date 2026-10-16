@@ -1,7 +1,9 @@
 """Coordinate projection and MGRS conversion utilities."""
 
 import logging
+import math
 import re
+from dataclasses import dataclass
 
 import lanelet2
 import mgrs
@@ -65,6 +67,111 @@ def _mgrs_grid_square_utm(mgrs_grid: str) -> tuple[int, str, float, float]:
 def _utm_central_meridian(zone: int) -> float:
     """Return the central meridian (decimal degrees) of a UTM zone."""
     return (zone - 1) * 6 - 180 + 3
+
+
+@dataclass(frozen=True)
+class MgrsFrame:
+    """Frame origin encoded in an MGRS-grid-relative geoReference.
+
+    Inverse of :func:`_build_mgrs_frame_proj_string`: the PROJ string maps
+    the point ``(easting, northing)`` (standard UTM, zone ``zone``) to the
+    output origin ``(0, 0)``.
+
+    Attributes:
+        zone: UTM zone number.
+        is_south: True for the southern hemisphere.
+        easting: Standard UTM easting (m) of the frame origin.
+        northing: Standard UTM northing (m) of the frame origin.
+        offset_x: Frame origin relative to the SW corner of its 100 km grid
+            square, i.e. what ``MGRSProjector.forward()`` returns there and
+            the offset the converter subtracted from projected coordinates.
+        offset_y: Northing counterpart of ``offset_x``.
+        latitude: Latitude (deg) of the frame origin (1 m MGRS precision).
+        longitude: Longitude (deg) of the frame origin (1 m MGRS precision).
+    """
+
+    zone: int
+    is_south: bool
+    easting: float
+    northing: float
+    offset_x: float
+    offset_y: float
+    latitude: float
+    longitude: float
+
+
+def _parse_proj_params(proj_string: str) -> dict[str, str]:
+    """Parse ``+key=value`` (and bare ``+flag``) tokens of a PROJ string."""
+    params: dict[str, str] = {}
+    for token in proj_string.split():
+        if not token.startswith("+"):
+            continue
+        key, _, value = token[1:].partition("=")
+        params[key] = value
+    return params
+
+
+def parse_mgrs_frame_proj_string(proj_string: str) -> MgrsFrame | None:
+    """Recover the frame origin from an MGRS-grid-relative geoReference.
+
+    Recognises only the form emitted by :func:`_build_mgrs_frame_proj_string`
+    (``+proj=tmerc +lat_0=0 +lon_0=<UTM central meridian> +k_0=0.9996`` with
+    a non-zero ``+x_0``/``+y_0``). Its ``+lat_0``/``+lon_0`` are *not* the
+    map origin; the origin is the inverse projection of output ``(0, 0)``,
+    which for this form is simply the standard UTM point
+    ``(false_easting - x_0, false_northing - y_0)``.
+
+    Returns ``None`` for any other string -- e.g. a TransverseMercator
+    geoReference (``+x_0=0 +y_0=0``, real ``lat_0``/``lon_0``) or a pre-#550
+    ``+proj=utm`` string -- whose ``+lat_0``/``+lon_0`` are the real origin.
+    """
+    utm = DEFAULT_CONFIG.utm
+    params = _parse_proj_params(proj_string)
+    if params.get("proj") != "tmerc":
+        return None
+    try:
+        lat_0 = float(params["lat_0"])
+        lon_0 = float(params["lon_0"])
+        k_0 = float(params.get("k_0", params.get("k", "nan")))
+        x_0 = float(params["x_0"])
+        y_0 = float(params["y_0"])
+    except (KeyError, ValueError):
+        return None
+
+    tol = utm.param_tolerance
+    if abs(lat_0) > tol or abs(k_0 - utm.scale_factor) > tol:
+        return None
+    zone = round((lon_0 + 180.0 + utm.zone_width_deg / 2) / utm.zone_width_deg)
+    if not 1 <= zone <= utm.zone_count:
+        return None
+    if abs(_utm_central_meridian(zone) - lon_0) > tol:
+        return None
+    if x_0 == 0.0 and y_0 == 0.0:
+        # Also a valid TM frame centered on (0, lon_0); both readings agree.
+        return None
+
+    # The northern hemisphere has false northing 0, so y_0 = -northing <= 0;
+    # the southern one has y_0 = 10_000_000 - northing > 0.
+    is_south = y_0 > 0.0
+    false_northing = utm.false_northing_south if is_south else 0.0
+    easting = utm.false_easting - x_0
+    northing = false_northing - y_0
+
+    m = mgrs.MGRS()
+    mgrs_code = m.UTMToMGRS(zone, "S" if is_south else "N", easting, northing)
+    latitude, longitude = m.toLatLon(mgrs_code)
+
+    size = utm.mgrs_grid_square_size
+    return MgrsFrame(
+        zone=zone,
+        is_south=is_south,
+        easting=easting,
+        northing=northing,
+        offset_x=math.fmod(easting, size),
+        offset_y=math.fmod(northing, size),
+        latitude=latitude,
+        longitude=longitude,
+    )
 
 
 def _build_mgrs_frame_proj_string(

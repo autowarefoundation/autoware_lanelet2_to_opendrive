@@ -270,11 +270,22 @@ class UtmConstants:
         false_easting: Standard UTM false easting (m).
         false_northing_south: Standard UTM false northing for the southern
             hemisphere (m); the northern hemisphere uses 0.
+        mgrs_grid_square_size: Side length (m) of an MGRS 100 km grid
+            square; ``MGRSProjector`` emits ``fmod(utm, size)``.
+        zone_width_deg: Width (deg) of a UTM longitude zone.
+        zone_count: Number of UTM longitude zones.
+        param_tolerance: Absolute tolerance used when matching parsed PROJ
+            parameters (``+lat_0``, ``+lon_0``, ``+k_0``) against the
+            standard UTM values above.
     """
 
     scale_factor: float = 0.9996
     false_easting: float = 500_000.0
     false_northing_south: float = 10_000_000.0
+    mgrs_grid_square_size: float = 100_000.0
+    zone_width_deg: float = 6.0
+    zone_count: int = 60
+    param_tolerance: float = 1e-9
 
 
 @dataclass(frozen=True)
