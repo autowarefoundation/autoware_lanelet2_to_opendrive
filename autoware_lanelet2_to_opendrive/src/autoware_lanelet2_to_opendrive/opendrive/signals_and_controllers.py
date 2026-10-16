@@ -437,7 +437,7 @@ class SignalsAndControllers:
 
         # Reuse the reference line already fitted for this road, if the caller
         # supplied a cache.  Every input to the fit (map, road lanelets,
-        # routing graph) is fixed for the lifetime of that cache.
+        # routing graph, offset) is fixed for the lifetime of that cache.
         reference_line: Optional["ReferenceLine"] = (
             reference_line_cache.get(road_id)
             if reference_line_cache is not None
