@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 from tqdm import tqdm
 
+from .config import DEFAULT_CONFIG
 from .opendrive.enums import TrafficRule
 from .opendrive.geometry import (
     Arc,
@@ -32,6 +33,7 @@ from .opendrive.geometry import (
     evaluate_plan_view_world,
     param_for_offset,
 )
+from .util import CONVERTIBLE_LANELET_SUBTYPES, filter_lanelets_by_subtype
 
 if TYPE_CHECKING:
     import lanelet2.core
@@ -48,11 +50,10 @@ class MappingMismatchError(Exception):
 #: Mapping cache files are stored next to the source XODR file.
 
 #: Maximum mean distance (m) between a road reference line and a lanelet
-#: boundary for them to be considered a match.  This must be larger than
-#: the spline fitting error (max_avg_error=2.0 m in config) but smaller
-#: than a typical lane width (~3.5 m) so that we never confuse adjacent
-#: boundaries.
-_MATCH_THRESHOLD: float = 3.5
+#: boundary for them to be considered a match.  Defined in
+#: :class:`~.config.GeoMappingConstants`, which documents the window it has
+#: to sit in and why the current value sits at the top of it.
+_MATCH_THRESHOLD: float = DEFAULT_CONFIG.geo_mapping.match_threshold
 
 #: Weight for endpoint proximity penalty added to candidate distance.
 #: The penalty = (start_dist + end_dist) * weight, where start_dist and
@@ -60,6 +61,14 @@ _MATCH_THRESHOLD: float = 3.5
 #: to either endpoint of the candidate boundary.  This helps disambiguate
 #: geometrically similar junction lanelets that connect different roads.
 _ENDPOINT_WEIGHT: float = 0.1
+
+#: Margin (m) by which a road reference line's bounding box is grown before
+#: it is tested against a lanelet boundary's bounding box.  Boundaries that
+#: fail this test are dropped without measuring a distance.  It is a filter
+#: only: it has to stay comfortably above ``_MATCH_THRESHOLD`` (and above the
+#: rescue pass's ``rescue_threshold_factor`` multiple of it) so that no pair
+#: whose mean distance could fall under either threshold is ever discarded.
+_CANDIDATE_BBOX_MARGIN: float = 10.0
 
 #: Total geometry length (m) below which a connecting road
 #: (``junction != -1``) is treated as a synthetic divergence/merge stub
@@ -250,6 +259,100 @@ def _bboxes_overlap(
         or a[1] > b[3] + margin
         or a[3] < b[1] - margin
     )
+
+
+@dataclass(frozen=True)
+class _BoundaryGrid:
+    """Uniform grid over lanelet boundary bounding boxes.
+
+    Answers "which boundaries could be near this road reference line?" without
+    walking every boundary.  Built in the same style as
+    :func:`~.util.build_lanelet_intersection_adjacency`: the cell size is the
+    largest bounding-box extent in the input, which caps each boundary at 2x2
+    cells and keeps the grid at O(N) entries.
+
+    Attributes:
+        cell_size: Edge length (m) of a grid cell.
+        cells: Cell coordinate -> positions of the boundaries touching it.
+        lids: Lanelet IDs in the iteration order of the source dict.
+        boxes: Bounding boxes parallel to ``lids``.
+    """
+
+    cell_size: float
+    cells: dict[tuple[int, int], list[int]]
+    lids: list[int]
+    boxes: list[tuple[float, float, float, float]]
+
+
+def _build_boundary_grid(
+    boundaries: dict[int, np.ndarray],
+    bboxes: dict[int, tuple[float, float, float, float]],
+) -> _BoundaryGrid:
+    """Bucket boundary bounding boxes into a uniform grid.
+
+    ``lids`` keeps the iteration order of ``boundaries`` so that a caller can
+    replay the original scan order from the positions the grid returns.
+
+    Args:
+        boundaries: Lanelet ID -> boundary polyline
+        bboxes: Lanelet ID -> bounding box of that polyline
+
+    Returns:
+        The populated grid.
+    """
+    lids = list(boundaries)
+    boxes = [bboxes[lid] for lid in lids]
+
+    max_extent = 0.0
+    for box in boxes:
+        max_extent = max(max_extent, box[2] - box[0], box[3] - box[1])
+    cell_size = max(max_extent, DEFAULT_CONFIG.geometry.spatial_grid_min_cell_size)
+
+    cells: dict[tuple[int, int], list[int]] = {}
+    for position, box in enumerate(boxes):
+        for cell_x in range(int(box[0] // cell_size), int(box[2] // cell_size) + 1):
+            for cell_y in range(int(box[1] // cell_size), int(box[3] // cell_size) + 1):
+                cells.setdefault((cell_x, cell_y), []).append(position)
+
+    return _BoundaryGrid(cell_size=cell_size, cells=cells, lids=lids, boxes=boxes)
+
+
+def _grid_candidate_positions(
+    grid: _BoundaryGrid,
+    query: tuple[float, float, float, float],
+    margin: float,
+) -> list[int]:
+    """Positions of the boundaries that may overlap ``query`` grown by ``margin``.
+
+    Every boundary whose box overlaps the grown query box shares at least one
+    cell with it — the overlap contains a point, that point sits in some cell,
+    and both the boundary and the swept cell range cover that cell.  The result
+    is therefore a superset of the exact test and the filter has no false
+    negatives; callers still confirm each position with
+    :func:`_bboxes_overlap`.
+
+    Args:
+        grid: Grid to query
+        query: ``(min_x, min_y, max_x, max_y)`` of the query box
+        margin: Distance (m) by which ``query`` is grown before the lookup
+
+    Returns:
+        Positions into ``grid.lids``, ascending, so that iterating them
+        reproduces the source dict's order.
+    """
+    cell_size = grid.cell_size
+    min_x = int((query[0] - margin) // cell_size)
+    max_x = int((query[2] + margin) // cell_size)
+    min_y = int((query[1] - margin) // cell_size)
+    max_y = int((query[3] + margin) // cell_size)
+
+    positions: set[int] = set()
+    for cell_x in range(min_x, max_x + 1):
+        for cell_y in range(min_y, max_y + 1):
+            bucket = grid.cells.get((cell_x, cell_y))
+            if bucket is not None:
+                positions.update(bucket)
+    return sorted(positions)
 
 
 def _directed_mean_distance(from_line: np.ndarray, to_line: np.ndarray) -> float:
@@ -630,7 +733,11 @@ def _compute_all_candidates(
     # Exclude them up front and report them separately (#493).
     skipped_synthetic = _synthetic_connector_road_ids(roads)
 
-    for road in roads:
+    # Uniform grids over the two boundary populations, built on first use so
+    # that a map with a single traffic rule never pays for the unused side.
+    grids: dict[bool, Optional[_BoundaryGrid]] = {True: None, False: None}
+
+    for road in tqdm(roads, desc="Computing road candidates", unit="road"):
         if road.id in skipped_synthetic:
             continue
 
@@ -653,8 +760,31 @@ def _compute_all_candidates(
             is_rht = all(lid < 0 for lid in lane_ids)
 
         boundaries = lanelet_left if is_rht else lanelet_right
-        bboxes = lanelet_left_bbox if is_rht else lanelet_right_bbox
+        grid = grids[is_rht]
+        if grid is None:
+            grid = _build_boundary_grid(
+                boundaries, lanelet_left_bbox if is_rht else lanelet_right_bbox
+            )
+            grids[is_rht] = grid
         ref_bbox = _bbox(ref_line)
+
+        # Grid pre-filter.  ``_grid_candidate_positions`` returns a superset of
+        # the boundaries whose box overlaps ``ref_bbox``, in ascending position
+        # order, and the exact test below trims it to precisely the set the
+        # earlier exhaustive scan kept — in the same order, which matters
+        # because the nearest-rejected diagnostic breaks ties by first-seen.
+        # Every boundary is bbox-tested exactly once instead of once per
+        # fallback level, so the skip count is also hoisted out of the loop.
+        near: list[tuple[int, np.ndarray]] = []
+        for position in _grid_candidate_positions(
+            grid, ref_bbox, _CANDIDATE_BBOX_MARGIN
+        ):
+            if _bboxes_overlap(
+                ref_bbox, grid.boxes[position], margin=_CANDIDATE_BBOX_MARGIN
+            ):
+                near_lid = grid.lids[position]
+                near.append((near_lid, boundaries[near_lid]))
+        n_bbox_skip = len(boundaries) - len(near)
 
         # Progressive fallback search with 3 levels:
         #   1. Symmetric distance + direction check  (strictest)
@@ -676,32 +806,45 @@ def _compute_all_candidates(
         raw_dists: dict[int, float] = {}
         best_rejected_dist: float = float("inf")
         best_rejected_lid: Optional[int] = None
-        n_bbox_skip = 0
         n_dir_skip = 0
 
         # Pre-compute reference line endpoints for endpoint penalty
         ref_start = ref_line[0]
         ref_end = ref_line[-1]
 
+        # A boundary that survives into more than one fallback level would
+        # otherwise be measured against the same reference line again.  The
+        # directed distance is also the first half of the symmetric one
+        # (``_symmetric_mean_distance(boundary, ref_line)`` is the max of the
+        # two directions), so both levels share a single measurement.
+        directed_cache: dict[int, float] = {}
+        symmetric_cache: dict[int, float] = {}
+
+        def _distance(lid: int, boundary: np.ndarray, metric: str) -> float:
+            directed = directed_cache.get(lid)
+            if directed is None:
+                directed = _directed_mean_distance(boundary, ref_line)
+                directed_cache[lid] = directed
+            if metric != "symmetric":
+                return directed
+            symmetric = symmetric_cache.get(lid)
+            if symmetric is None:
+                symmetric = max(directed, _directed_mean_distance(ref_line, boundary))
+                symmetric_cache[lid] = symmetric
+            return symmetric
+
         for require_dir, metric in _FALLBACK_LEVELS:
             candidates.clear()
             raw_dists.clear()
             best_rejected_dist = float("inf")
             best_rejected_lid = None
-            n_bbox_skip = 0
             n_dir_skip = 0
 
-            for lid, boundary in boundaries.items():
-                if not _bboxes_overlap(ref_bbox, bboxes[lid]):
-                    n_bbox_skip += 1
-                    continue
+            for lid, boundary in near:
                 if require_dir and not _same_direction(ref_line, boundary):
                     n_dir_skip += 1
                     continue
-                if metric == "symmetric":
-                    dist = _symmetric_mean_distance(boundary, ref_line)
-                else:
-                    dist = _directed_mean_distance(boundary, ref_line)
+                dist = _distance(lid, boundary, metric)
                 if dist <= _MATCH_THRESHOLD:
                     # Endpoint proximity penalty for candidate ranking.
                     # Correct matches have aligned start/end points;
@@ -795,7 +938,13 @@ def _resolve_conflicts(
     # assignment[rc_idx] = index into all_rc[rc_idx].candidates
     assignment: dict[int, int] = {i: 0 for i in range(len(all_rc))}
 
+    # Both loops below run for an unknown number of rounds, so the bars count
+    # rounds rather than showing a percentage.  Without them this phase is
+    # silent, and on a large map that silence is indistinguishable from a hang.
+    rounds = tqdm(desc="Resolving candidate conflicts", unit="round")
+
     while True:
+        rounds.update()
         # Build claims: lanelet_id -> [(rc_idx, distance), ...]
         claims: dict[int, list[tuple[int, float]]] = {}
         for rc_idx, cand_idx in assignment.items():
@@ -901,6 +1050,8 @@ def _resolve_conflicts(
         if not had_conflict:
             break
 
+    rounds.close()
+
     # Remove entries where the candidate index is out of range
     valid = {
         rc_idx: cand_idx
@@ -913,26 +1064,47 @@ def _resolve_conflicts(
     # reduces the total raw distance, apply the swap.  Raw (geometric)
     # distances are used instead of ranking distances (which include the
     # endpoint penalty) for more accurate swap benefit calculation.
+    #
+    # Only a road whose own candidate set contains A's lanelet can be A's
+    # swap partner, so the pairs worth testing are found through an index
+    # rather than by walking every later road: the exhaustive form is
+    # quadratic in the road count and restarts after every swap, which cost
+    # 22 of the 26 minutes the mapping phase took on a 25k-lanelet map.
+    #
+    # ``raw_dists`` holds exactly the road's candidate lanelets and never
+    # changes here, so the index is built once.  ``order`` fixes each road's
+    # position for the whole search — ``valid`` only ever has existing keys
+    # reassigned below, never added or removed — and the per-lanelet position
+    # lists come out ascending, so the pairs are still visited in the
+    # ``i < j`` order of the exhaustive scan and the same swap is found first.
+    order = list(valid)
+    holders: dict[int, list[int]] = {}
+    for position, rc_idx in enumerate(order):
+        for cand_lid in all_rc[rc_idx].raw_dists:
+            holders.setdefault(cand_lid, []).append(position)
+
+    swaps = tqdm(desc="Fixing pairwise swaps", unit="pass")
     swap_found = True
     while swap_found:
+        swaps.update()
         swap_found = False
-        items = list(valid.items())
-        for i in range(len(items)):
-            rc_a, cand_a = items[i]
-            _, lid_a = all_rc[rc_a].candidates[cand_a]
-            raw_a = all_rc[rc_a].raw_dists.get(lid_a, float("inf"))
-            for j in range(i + 1, len(items)):
-                rc_b, cand_b = items[j]
-                _, lid_b = all_rc[rc_b].candidates[cand_b]
-                raw_b = all_rc[rc_b].raw_dists.get(lid_b, float("inf"))
+        for i, rc_a in enumerate(order):
+            _, lid_a = all_rc[rc_a].candidates[valid[rc_a]]
+            raw_dists_a = all_rc[rc_a].raw_dists
+            raw_a = raw_dists_a.get(lid_a, float("inf"))
+            for j in holders.get(lid_a, ()):
+                if j <= i:
+                    continue
+                rc_b = order[j]
+                _, lid_b = all_rc[rc_b].candidates[valid[rc_b]]
+                raw_dists_b = all_rc[rc_b].raw_dists
+                raw_b = raw_dists_b.get(lid_b, float("inf"))
 
-                # Does A have lid_b? Does B have lid_a?
-                raw_a_new = all_rc[rc_a].raw_dists.get(lid_b)
+                # Does A have lid_b?  B has lid_a by construction of the index.
+                raw_a_new = raw_dists_a.get(lid_b)
                 if raw_a_new is None:
                     continue
-                raw_b_new = all_rc[rc_b].raw_dists.get(lid_a)
-                if raw_b_new is None:
-                    continue
+                raw_b_new = raw_dists_b[lid_a]
 
                 if raw_a_new + raw_b_new < raw_a + raw_b:
                     # Find the candidate indices for the swapped lanelets
@@ -963,6 +1135,8 @@ def _resolve_conflicts(
             if swap_found:
                 break
 
+    swaps.close()
+
     return valid
 
 
@@ -990,9 +1164,13 @@ def build_mapping(
        (negative-only = RHT, positive-only = LHT).
     2. RHT: road reference line was generated from a lanelet's **left**
        boundary.  LHT: from a lanelet's **right** boundary.
-    3. Compare the road's reference line polyline against all candidate
-       lanelet boundaries.  The one with the smallest mean nearest-point
-       distance (below ``_MATCH_THRESHOLD``) is the *reference lanelet*.
+    3. Compare the road's reference line polyline against the candidate
+       lanelet boundaries.  Candidates are the lanelets the conversion can
+       map — ``CONVERTIBLE_LANELET_SUBTYPES`` plus anything carrying
+       ``turn_direction`` — so that subtypes the converter never emits
+       (crosswalks, for instance) cannot win a road.  The candidate with the
+       smallest mean nearest-point distance (below ``_MATCH_THRESHOLD``) is
+       the *reference lanelet*.
     4. From the reference lanelet, walk adjacent lanelets (via shared
        boundary linestring IDs) and assign lane IDs from the road's
        lane structure.
@@ -1020,7 +1198,40 @@ def build_mapping(
     left_bound_to_lanelets: dict[int, list[int]] = {}
     right_bound_to_lanelets: dict[int, list[int]] = {}
 
-    lanelets = list(lanelet_map.laneletLayer)
+    # Restrict the candidate pool to the lanelets the conversion can actually
+    # place on a road, so both mappings search the same population.  Regular
+    # roads come from ``CONVERTIBLE_LANELET_SUBTYPES`` (see
+    # ``Road.construct_from_lanelet_map``) and connecting roads come from the
+    # lanelets carrying ``turn_direction`` (see
+    # ``Junction.construct_from_lanelet_map``), so the union of the two is the
+    # exact domain of the conversion-time mapping.  Without this filter a
+    # crosswalk — which has no conversion-time entry — could still win a road
+    # as its geometric match and be reported as a mismatch.
+    #
+    # ``filter_lanelets_by_subtype`` returns a set, so the ids are collected
+    # first and the layer is re-walked in its own order: downstream nearest
+    # neighbour searches break ties by iteration order, and the mapping is
+    # documented as deterministic.
+    all_lanelets = list(lanelet_map.laneletLayer)
+    convertible_ids = {
+        ll.id
+        for ll in filter_lanelets_by_subtype(all_lanelets, CONVERTIBLE_LANELET_SUBTYPES)
+    }
+    lanelets = [
+        ll
+        for ll in all_lanelets
+        if ll.id in convertible_ids or "turn_direction" in ll.attributes
+    ]
+    n_excluded = len(all_lanelets) - len(lanelets)
+    if n_excluded:
+        logger.info(
+            "Geometric mapping candidate pool: %d of %d lanelets "
+            "(%d excluded as non-convertible subtypes)",
+            len(lanelets),
+            len(all_lanelets),
+            n_excluded,
+        )
+
     for ll in tqdm(lanelets, desc="Pre-computing lanelet boundaries", unit="lanelet"):
         lid = ll.id
         lp = np.array([(p.x - offset_x, p.y - offset_y) for p in ll.leftBound])
@@ -1102,6 +1313,22 @@ def build_mapping(
 
     mapping: dict[int, tuple[int, int]] = {}
     matched_lanelets: set[int] = set()
+
+    # The adjacency walks below check ``resolved_references`` but not
+    # ``matched_lanelets``, so a later road can silently claim a lanelet an
+    # earlier road already committed.  Whether the first or the second claim is
+    # the correct one is not decidable here, so the walks are left alone and
+    # the collisions are recorded for reporting instead.
+    overwrites: list[tuple[int, tuple[int, int], tuple[int, int]]] = []
+
+    def _commit(walk: list[tuple[int, int, int]]) -> None:
+        """Write walk results into ``mapping``, recording any re-assignment."""
+        for lid, rid, lane_id in walk:
+            previous = mapping.get(lid)
+            if previous is not None and previous != (rid, lane_id):
+                overwrites.append((lid, previous, (rid, lane_id)))
+            mapping[lid] = (rid, lane_id)
+            matched_lanelets.add(lid)
 
     # Phase 1: compute candidate lists for every road (no exclusion)
     all_rc, no_candidate_diag, skipped_synthetic = _compute_all_candidates(
@@ -1220,32 +1447,48 @@ def build_mapping(
                         current = next_ll
 
         # Commit walk results
-        for lid, rid, lane_id in walk_result:
-            mapping[lid] = (rid, lane_id)
-            matched_lanelets.add(lid)
+        _commit(walk_result)
 
     # -- Rescue pass: attempt to assign dropped roads -----------------------
     # Roads that had candidates in Phase 1 but were dropped in Phase 2
     # (conflict resolution) get a second chance with a relaxed search
     # against currently unmatched lanelets.
-    _RESCUE_THRESHOLD: float = _MATCH_THRESHOLD * 1.5
+    _RESCUE_THRESHOLD: float = (
+        _MATCH_THRESHOLD * DEFAULT_CONFIG.geo_mapping.rescue_threshold_factor
+    )
     assigned_rc_indices = set(assignment.keys())
     rescued_road_ids: set[int] = set()
-    for rc_idx in range(len(all_rc)):
-        if rc_idx in assigned_rc_indices:
-            continue
+    dropped_rc_indices = [
+        rc_idx for rc_idx in range(len(all_rc)) if rc_idx not in assigned_rc_indices
+    ]
+    # Same grid pre-filter as Phase 1, for the same reason: the exhaustive
+    # form walks every boundary on the map once per dropped road.  The grid's
+    # default bbox margin below is ``_CANDIDATE_BBOX_MARGIN``, so querying it
+    # with that margin returns a superset of what the exact test keeps, in the
+    # boundary dict's own order — the nearest match is therefore unchanged,
+    # ties included.  Built on first use so a map with no dropped roads, or
+    # with a single traffic rule, never pays for it.
+    rescue_grids: dict[bool, Optional[_BoundaryGrid]] = {True: None, False: None}
+    for rc_idx in tqdm(dropped_rc_indices, desc="Rescuing dropped roads", unit="road"):
         rc = all_rc[rc_idx]
         boundaries = lanelet_left if rc.is_rht else lanelet_right
         bboxes = lanelet_left_bbox if rc.is_rht else lanelet_right_bbox
+        grid = rescue_grids[rc.is_rht]
+        if grid is None:
+            grid = _build_boundary_grid(boundaries, bboxes)
+            rescue_grids[rc.is_rht] = grid
         ref_bbox = _bbox(rc.ref_line)
         best_lid: Optional[int] = None
         best_dist = _RESCUE_THRESHOLD
-        for lid, boundary in boundaries.items():
+        for position in _grid_candidate_positions(
+            grid, ref_bbox, _CANDIDATE_BBOX_MARGIN
+        ):
+            lid = grid.lids[position]
             if lid in matched_lanelets:
                 continue
-            if not _bboxes_overlap(ref_bbox, bboxes[lid]):
+            if not _bboxes_overlap(ref_bbox, grid.boxes[position]):
                 continue
-            dist = _symmetric_mean_distance(boundary, rc.ref_line)
+            dist = _symmetric_mean_distance(boundaries[lid], rc.ref_line)
             if dist < best_dist:
                 best_dist = dist
                 best_lid = lid
@@ -1262,9 +1505,7 @@ def build_mapping(
                 if next_ll is None or next_ll in matched_lanelets:
                     break
                 current = next_ll
-            for lid, rid, lane_id in walk_result_rescue:
-                mapping[lid] = (rid, lane_id)
-                matched_lanelets.add(lid)
+            _commit(walk_result_rescue)
             rescued_road_ids.add(rc.road_id)
             logger.info(
                 "Rescue: road %d recovered via lanelet %d (dist=%.3f, lanes=%d/%d)",
@@ -1285,10 +1526,18 @@ def build_mapping(
     # separately rather than counted as 0-candidate matching failures.
     roads_no_candidates = all_road_ids - rc_road_ids - skipped_synthetic
     roads_dropped_phase2 = rc_road_ids - assigned_road_ids
+    # One pass over ``mapping`` instead of one per assigned road: the inner
+    # scan below used to walk all ~18k entries for each of the ~10k roads,
+    # 175M comparisons for a diagnostic line, and was the 95 seconds between
+    # the last rescue and "Built lanelet-to-road mapping" on a 25k-lanelet map.
+    lanes_by_road: dict[int, set[int]] = {}
+    for mapped_road_id, mapped_lane_id in mapping.values():
+        lanes_by_road.setdefault(mapped_road_id, set()).add(mapped_lane_id)
+
     roads_not_fully_mapped: list[tuple[int, tuple[int, ...]]] = []
     for rc_idx, cand_idx in assignment.items():
         rc = all_rc[rc_idx]
-        mapped_lanes = {v[1] for k, v in mapping.items() if v[0] == rc.road_id}
+        mapped_lanes = lanes_by_road.get(rc.road_id, set())
         expected_lanes = set(rc.walk_lane_ids)
         if mapped_lanes != expected_lanes:
             missing_lanes = expected_lanes - mapped_lanes
@@ -1301,6 +1550,16 @@ def build_mapping(
         len(mapping),
         len({v[0] for v in mapping.values()}),
     )
+    if overwrites:
+        msg = (
+            f"  [Diag] Phase 3: {len(overwrites)} lanelets were re-assigned "
+            f"by a later road (the earlier assignment was dropped); "
+            f"{len({lid for lid, _, _ in overwrites})} distinct lanelets"
+        )
+        tqdm.write(msg)
+        logger.warning(msg)
+        for lid, previous, current in overwrites[:10]:
+            tqdm.write(f"    lanelet {lid}: {previous} -> {current}")
     if roads_no_candidates:
         msg = (
             f"  [Diag] Phase 1: {len(roads_no_candidates)} roads had 0 "
@@ -1383,12 +1642,19 @@ def validate_mapping_consistency(
     conversion_mapping: dict[int, tuple[int, int]],
     geo_mapping: GeoRoadLaneletMapping,
     preprocessing_log: dict | None = None,
-) -> None:
+    strict: bool = True,
+) -> bool:
     """Validate that conversion-time mapping matches geometric mapping.
 
     Compares each entry in the conversion-time mapping against the geometric
-    mapping.  Raises :class:`MappingMismatchError` if any lanelet ID maps to a
-    different ``(road_id, lane_id)`` pair.
+    mapping.  A lanelet ID that maps to a different ``(road_id, lane_id)``
+    pair — or that is present in only one of the two mappings — is a mismatch.
+
+    The geometric mapping is a *cross-check*, not the conversion output: it
+    re-derives the mapping from raw geometry and is subject to its own
+    matching-threshold and adjacency-walk heuristics.  A disagreement
+    therefore says the two derivations differ, not necessarily that the
+    emitted XODR is wrong, which is why ``strict`` exists.
 
     Args:
         conversion_mapping: Mapping produced during conversion
@@ -1397,10 +1663,17 @@ def validate_mapping_consistency(
         preprocessing_log: Optional preprocessing log dict (from
             ``PreprocessingLog.to_dict()``) to annotate mismatches with
             preprocessing context.
+        strict: When ``True`` (the default) a mismatch raises
+            :class:`MappingMismatchError`.  When ``False`` the mismatch is
+            logged as a warning and reported through the return value.
+
+    Returns:
+        ``True`` when the two mappings agree, ``False`` when they do not and
+        ``strict`` is ``False``.
 
     Raises:
         MappingMismatchError: When at least one entry differs between the two
-            mappings.
+            mappings and ``strict`` is ``True``.
     """
     # Build a set of merge-produced IDs and a lookup from the log.
     # Uses PreprocessingLog typed methods instead of raw dict parsing.
@@ -1446,17 +1719,30 @@ def validate_mapping_consistency(
     if mismatches:
         detail = "\n".join(mismatches[:20])
         total = len(mismatches)
-        raise MappingMismatchError(
+        summary = (
             f"Mapping mismatch: {total} entries differ between conversion-time "
             f"and geometric mappings:\n{detail}"
             + (f"\n  ... and {total - 20} more" if total > 20 else "")
         )
+        if strict:
+            raise MappingMismatchError(summary)
+        logger.warning(
+            "%s\nCross-validation is non-strict, so the conversion output is "
+            "kept.  Set strict_mapping_validation=true to fail instead.",
+            summary,
+        )
+        tqdm.write(
+            f"  Mapping cross-validation: {total} mismatching entries "
+            f"(non-fatal; see log for details)"
+        )
+        return False
 
     logger.info(
         "Cross-validation passed: conversion and geometric mappings agree "
         "(%d entries)",
         len(conversion_mapping),
     )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1506,6 +1792,7 @@ def validate_and_save_mapping(
     stop_line_mapping: dict[int, StopLineMappingEntry] | None = None,
     skipped_stop_lines: dict[int, SkippedStopLineEntry] | None = None,
     traffic_light_config: dict | None = None,
+    strict: bool = True,
 ) -> Path:
     """Save mapping JSON and cross-validate against geometric mapping.
 
@@ -1535,13 +1822,18 @@ def validate_and_save_mapping(
         traffic_light_config: Optional dict of TrafficLightConfig fields
             (offset_x, offset_y, offset_z, hdg_offset) persisted for the
             ``analyze`` command to reverse the spawn offset.
+        strict: When ``True`` a cross-validation mismatch raises
+            :class:`MappingMismatchError`.  When ``False`` the mismatch is
+            logged as a warning and the already-written XODR and
+            ``.mapping.json`` are kept — the conversion itself succeeded, and
+            the geometric mapping is only a heuristic cross-check.
 
     Returns:
         Path to the saved ``.mapping.json`` file.
 
     Raises:
         MappingMismatchError: When the conversion-time mapping disagrees with
-            the geometric mapping.
+            the geometric mapping and ``strict`` is ``True``.
     """
     # 1. SHA256
     xodr_sha256 = _sha256_of_file(xodr_path)
@@ -1568,10 +1860,11 @@ def validate_and_save_mapping(
     geo_mapping = build_mapping(
         lanelet_map, roads, mgrs_offset, xodr_sha256, osm_sha256
     )
-    validate_mapping_consistency(
-        lanelet_to_road_and_lane, geo_mapping, preprocessing_log
+    passed = validate_mapping_consistency(
+        lanelet_to_road_and_lane, geo_mapping, preprocessing_log, strict=strict
     )
-    logger.info("Cross-validation passed successfully!")
+    if passed:
+        logger.info("Cross-validation passed successfully!")
 
     return json_path
 

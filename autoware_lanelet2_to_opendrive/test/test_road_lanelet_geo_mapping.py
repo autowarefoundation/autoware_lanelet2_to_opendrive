@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -17,9 +18,15 @@ from autoware_lanelet2_to_opendrive.opendrive.geometry import (
     PlanView,
 )
 from autoware_lanelet2_to_opendrive.opendrive.road import Road
+from autoware_lanelet2_to_opendrive.config import DEFAULT_CONFIG
 from autoware_lanelet2_to_opendrive.road_lanelet_geo_mapping import (
     GeoRoadLaneletMapping,
     MappingMismatchError,
+    _bbox,
+    _bboxes_overlap,
+    _build_boundary_grid,
+    _CANDIDATE_BBOX_MARGIN,
+    _grid_candidate_positions,
     _RoadCandidates,
     _resolve_conflicts,
     _sample_reference_line_from_road,
@@ -88,6 +95,36 @@ class TestValidateMappingConsistency:
         )
         with pytest.raises(MappingMismatchError, match="3 entries differ"):
             validate_mapping_consistency(conversion, geo)
+
+    def test_strict_returns_true_on_match(self) -> None:
+        conversion = {10: (1, -1)}
+        geo = GeoRoadLaneletMapping(
+            xodr_sha256="a",
+            osm_sha256="b",
+            lanelet_to_road_and_lane={10: (1, -1)},
+        )
+        assert validate_mapping_consistency(conversion, geo) is True
+
+    def test_non_strict_returns_false_instead_of_raising(self) -> None:
+        conversion = {10: (1, -1), 20: (2, -1)}
+        geo = GeoRoadLaneletMapping(
+            xodr_sha256="a",
+            osm_sha256="b",
+            lanelet_to_road_and_lane={10: (1, -1), 20: (2, -2)},
+        )
+        assert validate_mapping_consistency(conversion, geo, strict=False) is False
+
+    def test_non_strict_logs_the_mismatch_detail(self, caplog) -> None:
+        conversion = {10: (1, -1)}
+        geo = GeoRoadLaneletMapping(
+            xodr_sha256="a",
+            osm_sha256="b",
+            lanelet_to_road_and_lane={10: (1, -2)},
+        )
+        with caplog.at_level("WARNING"):
+            validate_mapping_consistency(conversion, geo, strict=False)
+        assert "1 entries differ" in caplog.text
+        assert "lanelet 10" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +400,146 @@ class TestResolveConflicts:
 
 
 # ---------------------------------------------------------------------------
+# _resolve_conflicts: pairwise swap search
+# ---------------------------------------------------------------------------
+
+
+def _exhaustive_swap_fix(
+    all_rc: list[_RoadCandidates], valid: dict[int, int]
+) -> dict[int, int]:
+    """Reference swap search: the every-pair scan the indexed one replaces.
+
+    Kept verbatim (bar the debug log) so the production search can be checked
+    against it for both result and cost.  It is the definition of correct
+    here: the two must pick the same swaps, in the same order.
+    """
+    valid = dict(valid)
+    swap_found = True
+    while swap_found:
+        swap_found = False
+        items = list(valid.items())
+        for i in range(len(items)):
+            rc_a, cand_a = items[i]
+            _, lid_a = all_rc[rc_a].candidates[cand_a]
+            raw_a = all_rc[rc_a].raw_dists.get(lid_a, float("inf"))
+            for j in range(i + 1, len(items)):
+                rc_b, cand_b = items[j]
+                _, lid_b = all_rc[rc_b].candidates[cand_b]
+                raw_b = all_rc[rc_b].raw_dists.get(lid_b, float("inf"))
+
+                raw_a_new = all_rc[rc_a].raw_dists.get(lid_b)
+                if raw_a_new is None:
+                    continue
+                raw_b_new = all_rc[rc_b].raw_dists.get(lid_a)
+                if raw_b_new is None:
+                    continue
+
+                if raw_a_new + raw_b_new < raw_a + raw_b:
+                    valid[rc_a] = next(
+                        ci
+                        for ci, (_, cand_lid) in enumerate(all_rc[rc_a].candidates)
+                        if cand_lid == lid_b
+                    )
+                    valid[rc_b] = next(
+                        ci
+                        for ci, (_, cand_lid) in enumerate(all_rc[rc_b].candidates)
+                        if cand_lid == lid_a
+                    )
+                    swap_found = True
+                    break
+            if swap_found:
+                break
+    return valid
+
+
+def _conflict_free_population(
+    rng: np.random.Generator, count: int, extras: int, pool: int
+) -> list[_RoadCandidates]:
+    """Roads whose *top* candidates are all distinct, so no road is in conflict.
+
+    The conflict loop then leaves every road on candidate 0 and the swap
+    search is the only thing that runs, which is what these tests measure.
+    Lower-ranked candidates are drawn from a shared pool, so roads do overlap
+    there and swaps are possible.
+    """
+    all_rc: list[_RoadCandidates] = []
+    for index in range(count):
+        top = (1.0 + float(rng.uniform(0.0, 0.5)), index)
+        others = {
+            int(rng.integers(count, count + pool)): 1.5 + float(rng.uniform(0.0, 1.0))
+            for _ in range(extras)
+        }
+        candidates = sorted([top] + [(dist, lid) for lid, dist in others.items()])
+        all_rc.append(_make_rc(1000 + index, candidates))
+    return all_rc
+
+
+class TestSwapSearch:
+    """The swap search finds pairs through a candidate index instead of
+    scanning every later road.  It must pick the same swaps as the exhaustive
+    scan, and it must stop being quadratic in the road count."""
+
+    def test_swap_is_applied_when_it_lowers_total_distance(self) -> None:
+        """Two roads each holding the other's nearer lanelet are swapped."""
+        # Greedy gives 100->10 and 200->20 (no conflict: different top
+        # candidates), but 100 is nearer 20 and 200 is nearer 10.
+        rc_a = _make_rc(100, [(1.0, 10), (2.0, 20)], raw_dists={10: 5.0, 20: 0.5})
+        rc_b = _make_rc(200, [(1.5, 20), (3.0, 10)], raw_dists={20: 5.0, 10: 0.5})
+        assert _resolve_conflicts([rc_a, rc_b]) == {0: 1, 1: 1}
+
+    def test_no_swap_when_it_would_not_help(self) -> None:
+        rc_a = _make_rc(100, [(1.0, 10), (2.0, 20)], raw_dists={10: 0.5, 20: 5.0})
+        rc_b = _make_rc(200, [(1.5, 20), (3.0, 10)], raw_dists={20: 0.5, 10: 5.0})
+        assert _resolve_conflicts([rc_a, rc_b]) == {0: 0, 1: 0}
+
+    def test_matches_the_exhaustive_scan(self) -> None:
+        """Same assignment as the every-pair reference, over random inputs."""
+        rng = np.random.default_rng(20260920)
+        for _ in range(40):
+            all_rc = _conflict_free_population(rng, count=60, extras=3, pool=20)
+            expected = _exhaustive_swap_fix(
+                all_rc, {index: 0 for index in range(len(all_rc))}
+            )
+            assert _resolve_conflicts(all_rc) == expected
+
+    def test_is_no_longer_quadratic(self) -> None:
+        """The indexed search must beat the exhaustive one by a wide margin.
+
+        A ratio rather than an absolute wall-clock, so a loaded runner slows
+        both sides.  The two are timed **interleaved** and the **fastest**
+        sample of each is compared: timing one side to completion and then the
+        other lets a load spike land entirely on one of them (see
+        ``test_issue_registration_is_no_longer_quadratic``).
+        """
+        rng = np.random.default_rng(11)
+        count = 2000
+        rounds = 3
+        all_rc = _conflict_free_population(rng, count=count, extras=2, pool=40)
+        start = {index: 0 for index in range(len(all_rc))}
+
+        indexed_samples: list[float] = []
+        exhaustive_samples: list[float] = []
+        for _ in range(rounds):
+            t0 = time.perf_counter()
+            indexed = _resolve_conflicts(all_rc)
+            indexed_samples.append(time.perf_counter() - t0)
+
+            t0 = time.perf_counter()
+            exhaustive = _exhaustive_swap_fix(all_rc, start)
+            exhaustive_samples.append(time.perf_counter() - t0)
+
+        assert indexed == exhaustive
+        fastest_indexed = min(indexed_samples)
+        fastest_exhaustive = min(exhaustive_samples)
+        assert fastest_indexed * 4 < fastest_exhaustive, (
+            f"indexed={fastest_indexed:.3f}s exhaustive={fastest_exhaustive:.3f}s "
+            f"for {count} roads (best of {rounds}; "
+            f"indexed={[round(v, 3) for v in indexed_samples]} "
+            f"exhaustive={[round(v, 3) for v in exhaustive_samples]})"
+        )
+
+
+# ---------------------------------------------------------------------------
 # _sample_reference_line_from_road  (issue #495)
 # ---------------------------------------------------------------------------
 
@@ -560,3 +737,109 @@ class TestParseRoadsFromXodr:
         assert arc.curvature == pytest.approx(0.04)
         assert isinstance(pp3, ParamPoly3)
         assert pp3.cV == pytest.approx(0.1)
+
+
+# ---------------------------------------------------------------------------
+# Boundary grid pre-filter
+# ---------------------------------------------------------------------------
+
+
+class TestBoundaryGridPreFilter:
+    """The grid in front of the Phase-1 bbox test is a filter only: it must
+    return every boundary the exhaustive scan would have kept, in the same
+    order, so the candidate set and the nearest-rejected diagnostic are
+    unchanged."""
+
+    @staticmethod
+    def _population(
+        rng: np.random.Generator, count: int, extent: float
+    ) -> tuple[dict[int, np.ndarray], dict[int, tuple[float, float, float, float]]]:
+        boundaries: dict[int, np.ndarray] = {}
+        bboxes: dict[int, tuple[float, float, float, float]] = {}
+        for index in range(count):
+            start = rng.uniform(-extent, extent, size=2)
+            delta = rng.uniform(-40.0, 40.0, size=2)
+            pts = np.array([start, start + delta * 0.5, start + delta])
+            lid = 1000 + index * 7
+            boundaries[lid] = pts
+            bboxes[lid] = _bbox(pts)
+        return boundaries, bboxes
+
+    def test_grid_matches_exhaustive_scan(self) -> None:
+        rng = np.random.default_rng(20240513)
+        boundaries, bboxes = self._population(rng, 200, 300.0)
+        grid = _build_boundary_grid(boundaries, bboxes)
+
+        for _ in range(200):
+            start = rng.uniform(-300.0, 300.0, size=2)
+            delta = rng.uniform(-60.0, 60.0, size=2)
+            ref_bbox = _bbox(np.array([start, start + delta]))
+
+            exhaustive = [
+                lid
+                for lid in boundaries
+                if _bboxes_overlap(ref_bbox, bboxes[lid], margin=_CANDIDATE_BBOX_MARGIN)
+            ]
+            filtered = [
+                grid.lids[position]
+                for position in _grid_candidate_positions(
+                    grid, ref_bbox, _CANDIDATE_BBOX_MARGIN
+                )
+                if _bboxes_overlap(
+                    ref_bbox, grid.boxes[position], margin=_CANDIDATE_BBOX_MARGIN
+                )
+            ]
+            assert filtered == exhaustive
+
+    def test_grid_query_is_a_superset_of_the_exact_test(self) -> None:
+        """The cell sweep alone — before the exact test — already contains
+        every overlapping boundary."""
+        rng = np.random.default_rng(7)
+        boundaries, bboxes = self._population(rng, 120, 150.0)
+        grid = _build_boundary_grid(boundaries, bboxes)
+
+        for _ in range(100):
+            start = rng.uniform(-150.0, 150.0, size=2)
+            ref_bbox = _bbox(
+                np.array([start, start + rng.uniform(-50.0, 50.0, size=2)])
+            )
+            swept = {
+                grid.lids[position]
+                for position in _grid_candidate_positions(
+                    grid, ref_bbox, _CANDIDATE_BBOX_MARGIN
+                )
+            }
+            overlapping = {
+                lid
+                for lid in boundaries
+                if _bboxes_overlap(ref_bbox, bboxes[lid], margin=_CANDIDATE_BBOX_MARGIN)
+            }
+            assert overlapping <= swept
+
+    def test_margin_covers_the_rescue_threshold(self) -> None:
+        """The filter margin has to sit above every distance threshold that a
+        surviving pair is later measured against, or a real match could be
+        discarded before it is ever measured."""
+        rescue_threshold = (
+            DEFAULT_CONFIG.geo_mapping.match_threshold
+            * DEFAULT_CONFIG.geo_mapping.rescue_threshold_factor
+        )
+        assert _CANDIDATE_BBOX_MARGIN > rescue_threshold
+
+    def test_empty_population(self) -> None:
+        grid = _build_boundary_grid({}, {})
+        assert grid.lids == []
+        assert _grid_candidate_positions(grid, (0.0, 0.0, 10.0, 10.0), 10.0) == []
+
+    def test_zero_extent_boundaries_do_not_collapse_the_grid(self) -> None:
+        """A population of coincident points has no extent; the cell size
+        falls back to the configured floor rather than zero."""
+        boundaries = {1: np.array([[5.0, 5.0], [5.0, 5.0]])}
+        bboxes = {1: _bbox(boundaries[1])}
+        grid = _build_boundary_grid(boundaries, bboxes)
+
+        assert grid.cell_size == DEFAULT_CONFIG.geometry.spatial_grid_min_cell_size
+        assert (
+            grid.lids[_grid_candidate_positions(grid, (0.0, 0.0, 1.0, 1.0), 10.0)[0]]
+            == 1
+        )

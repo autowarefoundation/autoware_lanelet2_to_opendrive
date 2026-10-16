@@ -11,7 +11,9 @@ emitted ``.xodr`` is byte-identical.
 
 import logging
 import re
+import warnings
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Tuple
 
 import lanelet2
@@ -20,6 +22,7 @@ from autoware_lanelet2_extension_python.projection import MGRSProjector
 from omegaconf import DictConfig
 
 from .conversion_config import OriginSpec
+from .map_projector_info import MAP_PROJECTOR_INFO_FILENAME, MapProjectorInfo
 from .projection import (
     latlon_to_lanelet2_origin,
     latlon_to_proj_string,
@@ -30,6 +33,42 @@ from .projection import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Once-per-process guard for the legacy-origin-key logger.warning (the
+# DeprecationWarning is already de-duplicated per call site by the warnings
+# module's default filters).
+_legacy_origin_keys_logged = False
+
+
+def _warn_legacy_origin_keys(stacklevel: int) -> None:
+    """Emit the soft-deprecation notice for the explicit origin keys.
+
+    Soft-deprecation (issue #539): map_projector_info.yaml is the canonical
+    origin source (see :func:`resolve_projection`). Emits a
+    DeprecationWarning (suppressed by default per PEP 565 outside
+    ``__main__``) and, once per process, a logger.warning so CLI users
+    actually see it. Removal is tracked in a future major version (#564).
+
+    Args:
+        stacklevel: Passed to :func:`warnings.warn`, counted from this
+            helper; callers pass ``3`` so the warning points at the code that
+            called the public resolver function.
+    """
+    global _legacy_origin_keys_logged
+    warnings.warn(
+        "Specifying the map origin via 'mgrs_grid'/'lat_lon' config keys is "
+        "deprecated; provide a map_projector_info.yaml next to the .osm map "
+        "instead. This fallback will be removed in a future major version "
+        "(see #564).",
+        DeprecationWarning,
+        stacklevel=stacklevel,
+    )
+    if not _legacy_origin_keys_logged:
+        _legacy_origin_keys_logged = True
+        logger.warning(
+            "Origin resolved via legacy 'mgrs_grid'/'lat_lon' config keys "
+            "(deprecated). Prefer map_projector_info.yaml. See #564."
+        )
 
 
 def geo_reference_for_origin(origin_spec: OriginSpec) -> str:
@@ -91,7 +130,20 @@ class ResolvedProjection:
 
 
 def resolve_projection_from_hydra(cfg: DictConfig) -> ResolvedProjection:
-    """Resolve the coordinate frame from a Hydra config.
+    """Resolve the coordinate frame from the explicit Hydra origin keys.
+
+    Deprecated entry point: emits the legacy-origin-key deprecation notice
+    (see :func:`_warn_legacy_origin_keys`). Prefer :func:`resolve_projection`
+    with a ``map_projector_info.yaml`` next to the map. See
+    :func:`_resolve_from_explicit_keys` for the accepted keys and errors.
+    """
+    resolved = _resolve_from_explicit_keys(cfg)
+    _warn_legacy_origin_keys(stacklevel=3)
+    return resolved
+
+
+def _resolve_from_explicit_keys(cfg: DictConfig) -> ResolvedProjection:
+    """Resolve the coordinate frame from a Hydra config (no deprecation notice).
 
     Supports three mutually exclusive origin specifications (identical to the
     previous ``parse_origin_from_config`` behavior):
@@ -220,3 +272,93 @@ def resolve_projection_from_hydra(cfg: DictConfig) -> ResolvedProjection:
         origin_lat=latitude,
         origin_lon=longitude,
     )
+
+
+def _resolve_from_map_projector_info(
+    info: MapProjectorInfo, info_path: Path
+) -> Optional[ResolvedProjection]:
+    """Build a :class:`ResolvedProjection` from a ``map_projector_info.yaml``.
+
+    Only ``projector_type: MGRS`` is supported here; it reproduces the exact
+    projector/geoReference of the equivalent explicit ``mgrs_grid`` config,
+    so existing MGRS outputs stay byte-identical. Other projector types
+    return ``None`` so the caller falls back to the explicit origin keys.
+
+    Args:
+        info: The parsed ``map_projector_info.yaml``.
+        info_path: Path to the file (used in error messages).
+
+    Returns:
+        A :class:`ResolvedProjection` for MGRS, or ``None`` for unsupported
+        projector types.
+
+    Raises:
+        ValueError: If ``projector_type`` is MGRS but ``mgrs_grid`` is
+            missing.
+    """
+    if info.projector_type.upper() == "MGRS":
+        if info.mgrs_grid is None:
+            raise ValueError(
+                f"{info_path}: projector_type 'MGRS' requires a 'mgrs_grid' field"
+            )
+        origin = mgrs_to_lanelet2_origin(info.mgrs_grid)
+        origin_lat, origin_lon = mgrs_grid_with_offset_to_latlon(
+            info.mgrs_grid, 0.0, 0.0
+        )
+        return ResolvedProjection(
+            origin=origin,
+            mgrs_code=info.mgrs_grid,
+            origin_lat=origin_lat,
+            origin_lon=origin_lon,
+        )
+    return None
+
+
+def resolve_projection(cfg: DictConfig, input_map_path: Path) -> ResolvedProjection:
+    """Resolve the coordinate frame, preferring ``map_projector_info.yaml``.
+
+    When that file sits next to ``input_map_path`` and declares a supported
+    projector, it drives the frame and any explicit ``cfg.map`` origin keys
+    are ignored. Otherwise resolution falls back to the explicit origin keys:
+
+    * no ``map_projector_info.yaml``: the keys are used and the soft
+      deprecation notice is emitted (the yaml is the non-deprecated route);
+    * a ``map_projector_info.yaml`` with a not-yet-supported
+      ``projector_type``: the keys are used *without* the deprecation notice,
+      since the user already provided the yaml and has no non-deprecated way
+      to resolve the origin; a warning says the keys remain required.
+
+    Args:
+        cfg: Hydra configuration object with a ``map`` section.
+        input_map_path: Path to the input ``.osm`` map. The
+            ``map_projector_info.yaml`` is looked up in its directory.
+
+    Returns:
+        A :class:`ResolvedProjection`.
+
+    Raises:
+        ValueError: If the projector-info file is malformed, or the explicit
+            origin keys are missing/invalid on the fallback path.
+    """
+    info_path = Path(input_map_path).parent / MAP_PROJECTOR_INFO_FILENAME
+    if info_path.is_file():
+        info = MapProjectorInfo.from_yaml(info_path)
+        resolved = _resolve_from_map_projector_info(info, info_path)
+        if resolved is not None:
+            logger.info(
+                "Using %s as the canonical origin source (explicit origin keys, "
+                "if any, are ignored)",
+                info_path,
+            )
+            return resolved
+        logger.warning(
+            "projector_type %r in %s is not supported yet; the explicit origin "
+            "keys ('mgrs_grid'/'lat_lon') remain required for this map",
+            info.projector_type,
+            info_path,
+        )
+        return _resolve_from_explicit_keys(cfg)
+
+    resolved = _resolve_from_explicit_keys(cfg)
+    _warn_legacy_origin_keys(stacklevel=3)
+    return resolved

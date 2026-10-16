@@ -29,6 +29,12 @@ class GeometryConstants:
             ``type=curbstone`` or ``type=road_border``. Both ``inner`` and
             ``outer`` of the emitted ``<height>`` are set to this value, so
             the sidewalk surface sits flat on top of the curb. Issue #469.
+        spatial_grid_min_cell_size: Floor (m) on the cell size of the uniform
+            grid used to pre-filter candidate lanelet pairs before running an
+            exact geometric intersection test. Only guards against a
+            degenerate (zero-extent) input; it never affects the result,
+            because the grid is a filter and every surviving pair is still
+            confirmed geometrically.
         nearest_road_rerank_ulps: Relative width, in units of float64
             machine epsilon, of the band above the vectorised minimum distance
             whose candidates the nearest-road index re-ranks with
@@ -43,6 +49,7 @@ class GeometryConstants:
     divergence_min_segment_length: float = 0.01
     divergence_default_lane_width: float = 3.5
     sidewalk_height: float = 0.15
+    spatial_grid_min_cell_size: float = 1.0
     nearest_road_rerank_ulps: float = 8.0
 
 
@@ -77,6 +84,20 @@ class SplineConstants:
             reference line's own boundary tangent.  Beyond it the heading
             pin is dropped for that end (the position pin is kept), since
             forcing it would bend a short connector into an S-curve.
+        resample_spacing: Maximum spacing (m) between consecutive input points
+            handed to the reference-line spline fitter. Raw Lanelet2
+            boundaries are digitised with an arbitrary vertex density -- gaps
+            of tens of metres occur in practice -- while both the arc length
+            and the dynamic control-point count
+            (:func:`~autoware_lanelet2_to_opendrive.spline.compute_dynamic_control_points`)
+            are derived from the vertex *count*. A coarsely digitised
+            boundary therefore yields an under-parameterised fit that is
+            unconstrained between vertices and can bow metres away from the
+            polyline it is meant to reproduce. Subdividing every segment
+            longer than this value before fitting bounds that error; 1.0 m is
+            well below a lane width, so the inserted points pin the curve to
+            the polyline without adding meaningful shape of their own. Only ever adds points, so densely digitised boundaries
+            are unaffected.
     """
 
     speed_epsilon: float = 1e-12
@@ -97,6 +118,7 @@ class SplineConstants:
     curvature_multiplier: float = 1.5
     endpoint_pin_weight: float = 1e4
     max_heading_override_rad: float = 0.35
+    resample_spacing: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -161,8 +183,10 @@ class ParamPoly3Constants:
 
     Attributes:
         min_segment_length: Minimum allowed segment length in meters (0.5m default)
-                           Segments shorter than this will be rejected.
-                           CARLA requirement: segments must be >= 0.5m
+                           Segments shorter than this will be rejected; a whole
+                           spline shorter than this is emitted as a single
+                           straight segment (with a warning) instead.
+                           Floor for splitting roads into segments (CARLA, #203)
         default_segment_length: Target segment length for dynamic calculation (1.0m)
                                Used when num_segments is not explicitly specified
         max_segments: Maximum number of segments per road (100 default)
@@ -229,6 +253,36 @@ class ArcSpiralConstants:
 
 
 @dataclass(frozen=True)
+class GeoMappingConstants:
+    """Constants for the geometric lanelet -> (road_id, lane_id) mapping.
+
+    These govern the post-conversion cross-validation pass in
+    :mod:`autoware_lanelet2_to_opendrive.road_lanelet_geo_mapping`, which
+    re-derives the mapping from raw geometry and compares it against the
+    mapping produced during conversion.
+
+    Attributes:
+        match_threshold: Maximum mean distance (m) between a road reference
+            line and a lanelet boundary for them to be considered a match.
+            It must be larger than the spline fitting error
+            (:attr:`SplineConstants.max_avg_error`, 2.0 m) and smaller than
+            a typical lane width so that an adjacent boundary is never
+            mistaken for the correct one.  The current value sits at the
+            upper end of that window: Japanese urban lanes are ~3.0 m wide
+            in practice, so 3.5 m does admit the neighbouring boundary as a
+            candidate.  Narrowing it trades false matches for unmatched
+            roads, which is why it is exposed here rather than silently
+            retuned — see issue discussion in the module docstring.
+        rescue_threshold_factor: Multiplier applied to ``match_threshold``
+            for the relaxed second-chance search over roads dropped during
+            conflict resolution.
+    """
+
+    match_threshold: float = 3.5
+    rescue_threshold_factor: float = 1.5
+
+
+@dataclass(frozen=True)
 class ConversionConstants:
     """Main container for all internal constants used in the conversion process.
 
@@ -269,6 +323,7 @@ class ConversionConstants:
         opendrive: OpenDRIVE format constants
         parampoly3: ParamPoly3 geometry generation constants
         arcspiral: Arc/spiral classifier internal tunables
+        geo_mapping: Geometric mapping cross-validation constants
     """
 
     geometry: GeometryConstants = GeometryConstants()
@@ -278,6 +333,7 @@ class ConversionConstants:
     opendrive: OpenDriveConstants = OpenDriveConstants()
     parampoly3: ParamPoly3Constants = ParamPoly3Constants()
     arcspiral: ArcSpiralConstants = ArcSpiralConstants()
+    geo_mapping: GeoMappingConstants = GeoMappingConstants()
 
 
 @dataclass

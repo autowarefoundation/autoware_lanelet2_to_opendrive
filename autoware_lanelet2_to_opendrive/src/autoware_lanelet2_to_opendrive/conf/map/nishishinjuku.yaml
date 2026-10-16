@@ -1,7 +1,14 @@
 # Nishishinjuku map configuration
 
-# MGRS grid for map projection (REQUIRED)
-# Using MGRS grid with offset specification
+# DEPRECATED (#539): the origin keys below ('mgrs_grid' [+ 'offset'] /
+# 'lat_lon') are a legacy fallback. The canonical origin source is a
+# map_projector_info.yaml placed next to the .osm map; when it declares a
+# supported projector_type (currently MGRS), these keys are ignored. They are
+# still required when no map_projector_info.yaml exists, or when its
+# projector_type is not supported yet, and will be removed in a future major
+# version (see #564).
+
+# MGRS grid with offset (legacy, deprecated)
 mgrs_grid: 54SUE
 offset:
   x: 81655.73
@@ -12,19 +19,10 @@ offset:
 traffic_rule: "LHT"
 
 # Merge operations - merge multiple lanelets into one
-# The merged lanelet is added to the map (originals are kept)
+# The merged lanelet replaces the originals: it is added under a new synthetic
+# id and every listed lanelet is removed from the map
 merge_operations:
   - lanelet_ids: [112, 114]
-    validate: true
-  - lanelet_ids: [113, 116]
-    validate: true
-  - lanelet_ids: [113, 115]
-    validate: true
-  - lanelet_ids: [301024, 3001037, 301038]
-    validate: true
-  - lanelet_ids: [301029, 301030, 301031, 3001324]
-    validate: true
-  - lanelet_ids: [301021, 301033]
     validate: true
 
 # Move point operations - move points to specific coordinates
