@@ -1,7 +1,15 @@
 # Example map configuration using latitude/longitude coordinates
 # This format directly specifies the origin using geographic coordinates
 
-# Latitude/longitude origin (ALTERNATIVE FORMAT)
+# DEPRECATED (#539): the origin keys below ('mgrs_grid' [+ 'offset'] /
+# 'lat_lon') are a legacy fallback. The canonical origin source is a
+# map_projector_info.yaml placed next to the .osm map; when it declares a
+# supported projector_type (currently MGRS), these keys are ignored. They are
+# still required when no map_projector_info.yaml exists, or when its
+# projector_type is not supported yet, and will be removed in a future major
+# version (see #564).
+
+# Latitude/longitude origin (legacy, deprecated)
 lat_lon:
   latitude: -33.123456     # Latitude in decimal degrees
   longitude: 151.234567    # Longitude in decimal degrees
