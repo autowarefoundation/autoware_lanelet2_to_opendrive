@@ -47,6 +47,7 @@ ignore_errors = true
 [tool.pytest.ini_options]
 testpaths = [
     "autoware_lanelet2_to_opendrive/test",
+    "scripts",
 ]
 # No addopts: a bare ``pytest <node id>`` runs exactly that test. Opt in to
 # ``-n N`` (pytest-xdist) or ``--testmon`` per invocation. See
