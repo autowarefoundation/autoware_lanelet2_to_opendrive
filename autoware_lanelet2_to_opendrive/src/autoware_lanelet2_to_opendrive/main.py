@@ -48,6 +48,9 @@ from autoware_lanelet2_to_opendrive.opendrive.road import (
     Road,
 )
 from autoware_lanelet2_to_opendrive.opendrive.junction import Junction
+from autoware_lanelet2_to_opendrive.opendrive.objects import (
+    RoadSamplePointIndex,
+)
 from autoware_lanelet2_to_opendrive.opendrive.signals_and_controllers import (
     SignalsAndControllers,
 )
@@ -57,6 +60,7 @@ from autoware_lanelet2_to_opendrive.conversion_config import (
     OriginSpec,
     ParamPoly3Config,
     ParkingLotConfig,
+    SignalConfig,
     StopLineConfig,
     TrafficLightConfig,
     WidthEstimationConfig,
@@ -167,6 +171,7 @@ class _Lanelet2ToOpenDRIVEConverter:
         regular_roads: List[Road],
         lanelet_to_road_id: Dict[int, int],
         num_regular_groups: int,
+        routing_graph: Optional[RoutingGraph] = None,
     ) -> Tuple[
         List[Road],
         List[Junction],
@@ -182,6 +187,9 @@ class _Lanelet2ToOpenDRIVEConverter:
             lanelet_to_road_id: Existing lanelet-to-road mapping from regular roads
             num_regular_groups: Total number of regular road groups (including failed ones),
                 used to assign non-overlapping IDs to junction roads
+            routing_graph: Pre-built vehicle routing graph reused for the
+                whole junction phase. Building one is whole-map work, so
+                without it every junction pays for its own graph.
 
         Returns:
             Tuple of:
@@ -231,6 +239,7 @@ class _Lanelet2ToOpenDRIVEConverter:
             # onto a parallel regular road (root cause of issue #431).
             regular_roads=regular_roads,
             lanelet_to_road_id=lanelet_to_road_id,
+            routing_graph=routing_graph,
         )
 
         # Merge lanelet-to-road mappings
@@ -242,6 +251,12 @@ class _Lanelet2ToOpenDRIVEConverter:
             f"Using junction ID offset: {junction_id_offset} "
             f"(junction IDs will be {junction_id_offset}+)"
         )
+
+        # Hoisted out of the per-junction loop below: the road list and its
+        # id index are identical for every junction, so rebuilding them once
+        # per junction is O(total_roads * junctions) of pure overhead.
+        all_roads_for_junction = regular_roads + connecting_roads
+        road_id_to_road = {road.id: road for road in all_roads_for_junction}
 
         junctions = []
         for junction_index, junction_group in enumerate(junction_groups):
@@ -255,7 +270,6 @@ class _Lanelet2ToOpenDRIVEConverter:
 
             # Build connections for this junction
             connecting_road_ids = junction_to_roads.get(junction_id, [])
-            all_roads_for_junction = regular_roads + connecting_roads
             connections = Junction.build_connections_from_roads(
                 lanelet_map=self.lanelet_map,
                 junction_lanelet_group=junction_group,
@@ -263,6 +277,8 @@ class _Lanelet2ToOpenDRIVEConverter:
                 lanelet_to_road_id=lanelet_to_road_id,
                 connecting_road_ids=connecting_road_ids,
                 roads=all_roads_for_junction,
+                routing_graph=routing_graph,
+                road_id_to_road=road_id_to_road,
             )
 
             junction.connections = connections
@@ -346,8 +362,8 @@ class _Lanelet2ToOpenDRIVEConverter:
             road_to_lanelet_ids: Dictionary mapping road IDs to lanelet IDs
             lanelet_to_road_id: Dictionary mapping lanelet IDs to road IDs
             junctions: All junctions
-            routing_graph: Pre-built vehicle routing graph reused for the
-                outgoing-junction-link pass; built on demand when omitted.
+            routing_graph: Pre-built vehicle routing graph reused for every
+                pass below; built on demand when omitted.
 
         Returns:
             Mapping from lanelet ID to (road_id, lane_id) for all lanes.
@@ -359,6 +375,7 @@ class _Lanelet2ToOpenDRIVEConverter:
             connecting_roads=connecting_roads,
             lanelet_to_road_id=lanelet_to_road_id,
             road_to_lanelet_ids=road_to_lanelet_ids,
+            routing_graph=routing_graph,
         )
 
         # Set junction links for incoming roads
@@ -383,7 +400,9 @@ class _Lanelet2ToOpenDRIVEConverter:
 
         # Set lane links for all roads
         print("\n=== Building lane links for all roads ===")
-        lanelet_to_road_and_lane = Road.set_all_lane_links(self.lanelet_map, all_roads)
+        lanelet_to_road_and_lane = Road.set_all_lane_links(
+            self.lanelet_map, all_roads, routing_graph
+        )
         return lanelet_to_road_and_lane
 
     def _extract_and_assign_signals(
@@ -391,6 +410,7 @@ class _Lanelet2ToOpenDRIVEConverter:
         all_roads: List[Road],
         mapping: RoadLaneletMapping,
         junction_lanelets: List[lanelet2.core.Lanelet],
+        routing_graph: Optional[RoutingGraph] = None,
     ) -> SignalsAndControllers:
         """
         Extract traffic signals and assign to roads.
@@ -399,6 +419,8 @@ class _Lanelet2ToOpenDRIVEConverter:
             all_roads: All roads
             mapping: Road-lanelet bidirectional mapping
             junction_lanelets: List of junction lanelets
+            routing_graph: Pre-built vehicle routing graph reused for the
+                signal reference-line fits; built on demand when omitted.
 
         Returns:
             SignalsAndControllers object with all signals and controllers
@@ -420,6 +442,8 @@ class _Lanelet2ToOpenDRIVEConverter:
             exclude_non_junction_signals=self.config.exclude_non_junction_signals,
             junction_lanelet_ids=junction_lanelet_ids,
             traffic_light_config=self.config.traffic_light,
+            signal_config=self.config.signal,
+            routing_graph=routing_graph,
         )
         print(
             f"Extracted {len(signals_and_controllers.signals)} signals and "
@@ -465,6 +489,34 @@ class _Lanelet2ToOpenDRIVEConverter:
         """
         print("\n=== Associating controllers with junctions ===")
 
+        # Both indices below are invariant across the junction loop. Building
+        # them once turns the two per-junction full scans -- every road
+        # (O(J x R)) and every controller entry (O(J x C x E)) -- into
+        # lookups keyed by the handful of roads each junction touches.
+        controllers = signals_and_controllers.controllers
+
+        roads_by_junction_id: Dict[int, Set[int]] = {}
+        for road in all_roads:
+            roads_by_junction_id.setdefault(road.junction, set()).add(road.id)
+
+        # road_id -> positions in ``controllers`` of the controllers driving a
+        # signal on that road. Positions (not IDs) are stored so the emitted
+        # per-junction list keeps the original controller-list order even if
+        # the IDs are not ascending. Controllers with no control entries never
+        # enter the index, matching the previous ``if controller.controls``.
+        controller_positions_by_road: Dict[int, Set[int]] = {}
+        for position, controller in enumerate(controllers):
+            if not controller.controls:
+                continue
+            for control_entry in controller.controls:
+                signal_road_id = signals_and_controllers.signal_to_road_id.get(
+                    control_entry.signal_id
+                )
+                if signal_road_id is not None:
+                    controller_positions_by_road.setdefault(signal_road_id, set()).add(
+                        position
+                    )
+
         controllers_assigned_count = 0
         for junction in junctions:
             # Get all road IDs related to this junction
@@ -476,9 +528,7 @@ class _Lanelet2ToOpenDRIVEConverter:
             }
 
             # Include roads that belong to this junction by attribute
-            junction_roads_by_attribute = {
-                road.id for road in all_roads if road.junction == junction.id
-            }
+            junction_roads_by_attribute = roads_by_junction_id.get(junction.id, set())
 
             junction_related_road_ids = (
                 junction_incoming_road_ids
@@ -486,23 +536,19 @@ class _Lanelet2ToOpenDRIVEConverter:
                 | junction_roads_by_attribute
             )
 
-            # Find controllers whose signals are on roads related to this junction
-            junction_controller_ids: List[int] = []
-            for controller in signals_and_controllers.controllers:
-                if controller.controls:
-                    # Get road IDs for all signals controlled by this controller
-                    controller_road_ids = set()
-                    for control_entry in controller.controls:
-                        signal_road_id = signals_and_controllers.signal_to_road_id.get(
-                            control_entry.signal_id
-                        )
-                        if signal_road_id is not None:
-                            controller_road_ids.add(signal_road_id)
+            # Find controllers whose signals are on roads related to this
+            # junction: a controller qualifies as soon as one of its signal
+            # roads is junction-related, which is exactly what the inverted
+            # index resolves per road.
+            matched_positions: Set[int] = set()
+            for related_road_id in junction_related_road_ids:
+                positions = controller_positions_by_road.get(related_road_id)
+                if positions:
+                    matched_positions.update(positions)
 
-                    # If any of the controller's roads are related to this junction,
-                    # associate the controller with the junction
-                    if controller_road_ids & junction_related_road_ids:
-                        junction_controller_ids.append(controller.id)
+            junction_controller_ids: List[int] = [
+                controllers[position].id for position in sorted(matched_positions)
+            ]
 
             junction.controller_ids = junction_controller_ids
             controllers_assigned_count += len(junction_controller_ids)
@@ -511,7 +557,11 @@ class _Lanelet2ToOpenDRIVEConverter:
             f"Associated {controllers_assigned_count} controller references across {len(junctions)} junctions"
         )
 
-    def _extract_and_assign_crosswalks(self, all_roads: List[Road]) -> None:
+    def _extract_and_assign_crosswalks(
+        self,
+        all_roads: List[Road],
+        road_index: Optional[RoadSamplePointIndex] = None,
+    ) -> None:
         """Extract crosswalk lanelets and assign them as objects to the nearest roads.
 
         For each lanelet with subtype="crosswalk", this method:
@@ -521,6 +571,9 @@ class _Lanelet2ToOpenDRIVEConverter:
 
         Args:
             all_roads: All roads (regular + connecting) to search and assign to.
+            road_index: Sample-point index over ``all_roads``, shared with the
+                stop line pass so the roads are sampled once.  Built on demand
+                when omitted.
         """
         from autoware_lanelet2_to_opendrive.util import filter_lanelets_by_subtype
         from autoware_lanelet2_to_opendrive.opendrive.objects import (
@@ -538,7 +591,7 @@ class _Lanelet2ToOpenDRIVEConverter:
         road_objects: Dict[int, List] = {}
 
         for lanelet in crosswalk_lanelets:
-            best_road = find_nearest_road(lanelet, all_roads)
+            best_road = find_nearest_road(lanelet, all_roads, road_index=road_index)
             if best_road is None:
                 continue
             obj = CrosswalkObject.construct_from_crosswalk_lanelet(
@@ -707,6 +760,7 @@ class _Lanelet2ToOpenDRIVEConverter:
         stop_sign_stop_line_ids: Optional[Set[int]] = None,
         starting_signal_id: int = 0,
         road_marking_stop_line_ids: Optional[Set[int]] = None,
+        road_index: Optional[RoadSamplePointIndex] = None,
     ) -> Tuple[Dict[int, List[int]], Dict, Dict]:
         """Extract stop line linestrings and assign them as objects to nearest roads.
 
@@ -734,6 +788,9 @@ class _Lanelet2ToOpenDRIVEConverter:
             road_marking_stop_line_ids: Set of stop line linestring IDs from
                 road_marking regulatory elements.  These produce YieldSign (205)
                 and StopLine (294) signal pairs.
+            road_index: Sample-point index over ``all_roads``, shared with the
+                crosswalk pass so the roads are sampled once.  Built on demand
+                when omitted.
 
         Returns:
             Tuple of:
@@ -782,6 +839,7 @@ class _Lanelet2ToOpenDRIVEConverter:
         stop_sign_206_count = 0
         yield_sign_205_count = 0
         road_marking_294_count = 0
+        signal_country = self.config.signal.country
 
         for ls in self.lanelet_map.lineStringLayer:
             if "type" not in ls.attributes or ls.attributes["type"] != "stop_line":
@@ -790,7 +848,9 @@ class _Lanelet2ToOpenDRIVEConverter:
                 continue
             stop_line_ids_seen.add(ls.id)
 
-            best_road = find_nearest_road_for_linestring(ls, all_roads)
+            best_road = find_nearest_road_for_linestring(
+                ls, all_roads, road_index=road_index
+            )
             if best_road is None:
                 skipped_stop_lines[ls.id] = SkippedStopLineEntry(
                     reason="no_nearest_road"
@@ -832,7 +892,7 @@ class _Lanelet2ToOpenDRIVEConverter:
                     pitch=0.0,
                     orientation="-" if signal_t < 0 else "+",
                     dynamic="no",
-                    country="DE",
+                    country=signal_country,
                     type=signal_type,
                     subtype=-1,
                     value=-1.0,
@@ -1090,7 +1150,13 @@ class _Lanelet2ToOpenDRIVEConverter:
             junction_lanelet_to_road,
             junction_lanelets,
         ) = self._build_junction_structure(
-            regular_roads, lanelet_to_road_id, num_groups_after_synthesis
+            regular_roads,
+            lanelet_to_road_id,
+            num_groups_after_synthesis,
+            # Same reuse the divergence pass and ``_setup_connections`` rely
+            # on: the lanelet map is not mutated after construction, so the
+            # graph built by ``Road.construct_from_lanelet_map`` stays valid.
+            routing_graph=regular_result.routing_graph,
         )
 
         # Issue #291: fold synthetic divergence/merge junctions and their
@@ -1148,9 +1214,15 @@ class _Lanelet2ToOpenDRIVEConverter:
             routing_graph=regular_result.routing_graph,
         )
 
-        # Step 5: Extract and assign signals
+        # Step 5: Extract and assign signals. Reuse the same routing graph the
+        # divergence / junction-completion / connection passes already share —
+        # the lanelet map is not mutated after Road.construct_from_lanelet_map,
+        # so a rebuild here would only repeat identical work.
         signals_and_controllers = self._extract_and_assign_signals(
-            all_roads, mapping, junction_lanelets
+            all_roads,
+            mapping,
+            junction_lanelets,
+            routing_graph=regular_result.routing_graph,
         )
 
         # Step 6: Create and assign controllers
@@ -1158,8 +1230,13 @@ class _Lanelet2ToOpenDRIVEConverter:
             signals_and_controllers, junctions, all_roads
         )
 
+        # Crosswalk and stop line placement both search every road reference
+        # line for the sample point nearest each object.  One shared index
+        # samples the roads once instead of once per object, twice over.
+        road_sample_index = RoadSamplePointIndex(all_roads)
+
         # Step 6.5: Extract crosswalks and assign as road objects
-        self._extract_and_assign_crosswalks(all_roads)
+        self._extract_and_assign_crosswalks(all_roads, road_sample_index)
 
         # Step 6.6: Build stop line -> traffic light signal associations
         print("\n=== Building stop line to traffic light associations ===")
@@ -1207,6 +1284,7 @@ class _Lanelet2ToOpenDRIVEConverter:
             stop_sign_stop_line_ids,
             next_signal_id,
             road_marking_stop_line_ids=road_marking_stop_line_ids,
+            road_index=road_sample_index,
         )
 
         # Step 6.8: Add back-links to traffic light signals pointing to stop lines.
@@ -1257,6 +1335,29 @@ class _Lanelet2ToOpenDRIVEConverter:
             )
             all_roads.extend(parking_roads)
             print(f"Built {len(parking_roads)} parking roads")
+
+        # Step 6.95: Move the junction IDs above the road IDs (CARLA resolves
+        # both in one ID space). They were numbered from ``junction_id_offset``
+        # (issue #132) and written into the connecting roads and junction
+        # links as those were built, so shift every ID and reference by one
+        # amount now that all roads exist; the synthetic junctions (#291) keep
+        # their band 10000 above the others.
+        from autoware_lanelet2_to_opendrive.opendrive.junction import (
+            junction_id_base,
+            shift_junction_ids,
+        )
+
+        max_road_id = max((road.id for road in all_roads), default=-1)
+        junction_id_start = junction_id_base(
+            max_road_id, self.config.junction_id_offset
+        )
+        junction_id_shift = junction_id_start - self.config.junction_id_offset
+        if junction_id_shift:
+            shift_junction_ids(junctions, all_roads, junction_id_shift)
+            print(
+                f"Junction IDs start at {junction_id_start} instead of "
+                f"{self.config.junction_id_offset} (highest road ID {max_road_id})"
+            )
 
         # Step 7: Write OpenDRIVE output
         opendrive = self._write_opendrive_output(
@@ -1514,6 +1615,18 @@ def preprocess_and_convert_with_hydra(
         f"carla_stop_line={stopline_config.carla_stop_line}"
     )
 
+    # Build SignalConfig from Hydra config
+    # Priority: map config > target config > default
+    signal_dict = cfg.map.get("signal") or cfg.target.get("signal", {})
+    signal_config = SignalConfig(
+        country=(
+            signal_dict.get("country", SignalConfig.country)
+            if signal_dict
+            else SignalConfig.country
+        )
+    )
+    logger.info(f"Signal config: country={signal_config.country}")
+
     # Build TrafficLightConfig from Hydra config
     # Priority: map config > target config > default
     tl_dict = cfg.map.get("traffic_light") or cfg.target.get("traffic_light", {})
@@ -1570,6 +1683,7 @@ def preprocess_and_convert_with_hydra(
         stopline=stopline_config,
         traffic_light=tl_config,
         parking_lot=parking_config,
+        signal=signal_config,
     )
 
     # mgrs_code is already stored in conversion_config.origin.mgrs_code;
