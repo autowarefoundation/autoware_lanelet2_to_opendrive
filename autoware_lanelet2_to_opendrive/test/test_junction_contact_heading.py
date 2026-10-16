@@ -13,15 +13,12 @@ miss each other by exactly::
 
 where ``dpsi`` is the angle between the two reference lines' headings.
 
-Measured on nishishinjuku at 31e81c3f, before this fix, that identity
-accounted for all 59 ``lane_smoothness.contact_point_no_horizontal_gaps``
-errors that base reported: the inner borders already agreed to 1e-13 m in
-48 of them and the lane widths agreed to 6 mm in all 59, while ``dpsi``
-had a median of 1.92 deg.  Clearing the 1 cm ASAM tolerance at a 3 m lane
-needs ``dpsi < 0.19 deg``.  The error *counts* move as other changes land
--- they are named here only to show which defect the identity explains --
-but the identity itself is a property of the representation, not of a
-particular base.
+On a real junction-heavy map this identity accounted for every
+``lane_smoothness.contact_point_no_horizontal_gaps`` error: the inner borders
+and the lane widths already agreed, while ``dpsi`` was typically a couple of
+degrees.  Clearing the 1 cm ASAM tolerance at a 3 m lane needs
+``dpsi < 0.19 deg``.  The identity itself is a property of the
+representation, not of a particular map.
 
 These tests pin the behaviour that closes it: the junction phase hands the
 connecting road the linked road's endpoint *heading* alongside its endpoint
@@ -222,7 +219,9 @@ def test_end_heading_override_pins_the_far_end_too(connector_map):
     lanelet_map, _, connector = connector_map
 
     boundary = _connector_boundary()
-    target = math.radians(30.0)
+    # The connector's own end tangent is about 56.6 deg; stay well inside
+    # ``max_heading_override_rad`` of it so the guard keeps the pin.
+    target = math.radians(45.0)
 
     pinned = _fit(
         lanelet_map,
@@ -486,3 +485,78 @@ def test_pinned_junction_contacts_agree_on_heading():
             f"heading by more than {math.degrees(ASAM_IMPLIED_HEADING_TOLERANCE_RAD):.3f} "
             f"deg.\nWorst 10:\n{sample}"
         )
+
+
+# --------------------------------------------------------------------------
+# The lane widths must be sampled on the same reference line as the planView.
+# --------------------------------------------------------------------------
+
+
+def test_lane_section_uses_the_planview_reference_line(connector_map):
+    """The centre lane's reference line is the heading-pinned planView one.
+
+    Lane widths are measured against ``LaneSection.center_lane``; if that
+    spline is fitted with the position pin only, the widths are sampled on
+    a different curve (different start tangent, different length) than the
+    one the planView emits, and the lane borders are placed off it.
+    """
+    from autoware_lanelet2_to_opendrive.opendrive.road import Road
+
+    lanelet_map, _, connector = connector_map
+    overrides = dict(
+        start_xyz_override=(CONTACT_XY[0], CONTACT_XY[1], 0.0),
+        start_hdg_override=INCOMING_HEADING_RAD,
+    )
+
+    planview_line = _fit(lanelet_map, connector, **overrides)
+    road = Road.construct_from_lanelet_groups(
+        lanelet_map, [connector], road_id=1, traffic_rule="RHT", **overrides
+    )
+    lane_line = road.lanes.lane_sections[0].center_lane
+    assert isinstance(lane_line, ReferenceLine)
+
+    assert _angle_between(
+        _start_heading(planview_line), _start_heading(lane_line)
+    ) == pytest.approx(0.0, abs=1e-6)
+    assert _angle_between(
+        _end_heading(planview_line), _end_heading(lane_line)
+    ) == pytest.approx(0.0, abs=1e-6)
+    assert lane_line.centerline_2d.total_length == pytest.approx(
+        planview_line.centerline_2d.total_length, abs=1e-6
+    )
+
+
+def test_heading_override_far_from_the_tangent_is_ignored():
+    """A short connector is not bent into an S-curve by an implausible pin.
+
+    The override is ``max_heading_override_rad`` plus a margin away from the
+    connector's own tangent, so the guard drops it: the position pin still
+    holds, and the start heading stays the connector's own.
+    """
+    from autoware_lanelet2_to_opendrive.config import DEFAULT_CONFIG
+
+    limit = DEFAULT_CONFIG.spline.max_heading_override_rad
+    own_heading = 0.0
+    short = _build_lanelet(_straight((0.0, 0.0), own_heading, 4.0, count=5), 2001)
+    lanelet_map = lanelet2.core.LaneletMap()
+    lanelet_map.add(short)
+
+    far = own_heading + limit + math.radians(5.0)
+    guarded = _fit(
+        lanelet_map,
+        short,
+        start_xyz_override=(0.0, 0.0, 0.0),
+        start_hdg_override=far,
+    )
+    assert _angle_between(own_heading, _start_heading(guarded)) < math.radians(0.5)
+    assert np.allclose(guarded.centerline_2d.evaluate(0.0)[:2], (0.0, 0.0), atol=1e-3)
+
+    # Just inside the limit the pin is still honoured.
+    near = own_heading + limit - math.radians(1.0)
+    pinned = _fit(
+        lanelet_map,
+        short,
+        start_xyz_override=(0.0, 0.0, 0.0),
+        start_hdg_override=near,
+    )
+    assert _angle_between(near, _start_heading(pinned)) < ACHIEVED_HEADING_TOLERANCE_RAD

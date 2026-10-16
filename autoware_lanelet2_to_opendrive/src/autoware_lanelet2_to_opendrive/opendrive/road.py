@@ -464,10 +464,9 @@ class Road:
         roads whose lane borders must coincide have to agree on the tangent
         as well as the point.  With the point shared and the widths equal,
         a heading difference ``dpsi`` leaves the far border of a lane of
-        width ``w`` short by ``2 * w * sin(dpsi / 2)`` — on nishishinjuku
-        that is every one of the 59
-        ``lane_smoothness.contact_point_no_horizontal_gaps`` findings.  The
-        junction phase feeds it back as the connecting road's endpoint
+        width ``w`` short by ``2 * w * sin(dpsi / 2)``, which the ASAM
+        ``lane_smoothness.contact_point_no_horizontal_gaps`` check reports.
+        The junction phase feeds it back as the connecting road's endpoint
         tangent constraint.
 
         ``sorted_index`` is the 0-based position in
@@ -1198,6 +1197,9 @@ class Road:
                 routing_graph=routing_graph,
                 start_xyz_override=start_xyz_override,
                 end_xyz_override=end_xyz_override,
+                start_hdg_override=start_hdg_override,
+                end_hdg_override=end_hdg_override,
+                reference_line=reference_line,
             )
             lanes = Lanes(lane_sections=[lane_section])
             return lanes
