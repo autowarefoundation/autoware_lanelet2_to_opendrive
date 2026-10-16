@@ -391,7 +391,7 @@ def _road_heading_at_end(road_elem, at_start: bool) -> float:
     return base + math.atan2(dv, du)
 
 
-def test_pinned_junction_contacts_agree_on_heading():
+def test_pinned_junction_contacts_agree_on_heading(nishishinjuku_xodr):
     """Every pinned connecting-road contact leaves along the linked tangent.
 
     Scope: junction ``<connection>`` rows whose connecting road is a
@@ -409,7 +409,6 @@ def test_pinned_junction_contacts_agree_on_heading():
     import lxml.etree as ET
 
     from test_junction_endpoint_fidelity import (  # noqa: E402
-        _build_nishishinjuku_xodr,
         _distance3,
         _evaluate_lane_inner_edge,
     )
@@ -417,7 +416,7 @@ def test_pinned_junction_contacts_agree_on_heading():
         evaluate_road_endpoints,
     )
 
-    root = ET.parse(str(_build_nishishinjuku_xodr())).getroot()
+    root = ET.parse(str(nishishinjuku_xodr)).getroot()
     endpoints = evaluate_road_endpoints(root)
 
     road_by_id = {int(r.get("id")): r for r in root.findall("road")}
