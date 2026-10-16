@@ -4,9 +4,10 @@ Resolves the map's coordinate frame in one place: origin parsing (from a Hydra
 config or an :class:`OriginSpec`), projector construction, geoReference
 PROJ-string generation, and the coordinate offset applied during export.
 
-Behavior-preserving extraction of logic that previously lived inline in
-``main.py`` (issue #540): the resolved values are identical to before, so the
-emitted ``.xodr`` is byte-identical.
+The MGRS / explicit-key paths are a behavior-preserving extraction of logic
+that previously lived inline in ``main.py`` (issue #540): their outputs remain
+byte-identical. TransverseMercator support and the soft deprecation of the
+explicit origin keys were added on top.
 """
 
 import logging
