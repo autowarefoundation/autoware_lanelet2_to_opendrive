@@ -37,8 +37,6 @@ WORKDIR /workspace
 FROM base AS deps
 COPY pyproject.toml uv.lock .python-version ./
 COPY autoware_lanelet2_to_opendrive/ autoware_lanelet2_to_opendrive/
-COPY autoware_carla_scenario/ autoware_carla_scenario/
-COPY carla_wheels/ carla_wheels/
 RUN uv sync --frozen --dev --extra carla
 
 FROM deps AS dev
@@ -52,13 +50,6 @@ CMD ["bash"]
 FROM base AS deps-nocarla
 COPY pyproject.toml uv.lock .python-version ./
 COPY autoware_lanelet2_to_opendrive/ autoware_lanelet2_to_opendrive/
-COPY autoware_carla_scenario/ autoware_carla_scenario/
-# carla_wheels/ must be copied even though this stage never installs the
-# carla extra: pyproject.toml's `[tool.uv] find-links = ["carla_wheels"]` is
-# an unconditional setting, so `uv sync` fails if the directory doesn't
-# exist. The wheel inside (carla-0.10.0-cp310-cp310-linux_x86_64.whl,
-# x86_64-only) is never used by this stage.
-COPY carla_wheels/ carla_wheels/
 RUN uv sync --frozen --dev
 
 FROM deps-nocarla AS dev-nocarla

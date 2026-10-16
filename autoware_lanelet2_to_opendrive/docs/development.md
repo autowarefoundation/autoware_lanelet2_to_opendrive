@@ -22,11 +22,10 @@ git clone https://github.com/tier4/autoware_lanelet2_to_opendrive.git
 cd autoware_lanelet2_to_opendrive
 ```
 
-The repository is a `uv` workspace with two members:
+The repository is a `uv` workspace whose only member is
 [`autoware_lanelet2_to_opendrive/`](https://github.com/tier4/autoware_lanelet2_to_opendrive/tree/master/autoware_lanelet2_to_opendrive)
-(the converter, this package) and
-[`autoware_carla_scenario/`](https://github.com/tier4/autoware_lanelet2_to_opendrive/tree/master/autoware_carla_scenario)
-(scenario / CARLA integration). A single `uv sync` installs both.
+(the converter, this package). The CARLA scenario framework that used to be
+the second member now lives in [its own repository](https://github.com/hakuturu583/autoware_carla_scenario).
 
 ### Installing dependencies
 
@@ -34,7 +33,7 @@ The repository is a `uv` workspace with two members:
 # Sync the workspace from uv.lock (frozen, reproducible)
 uv sync --dev
 
-# Optional: also pull in the CARLA Python wheel for the autoware_carla_scenario package
+# Optional: also pull in the CARLA Python wheel for carla-import-test
 uv sync --dev --extra carla
 ```
 
@@ -44,22 +43,39 @@ uv sync --dev --extra carla
 uv run pre-commit install
 ```
 
-The configured hooks (see [`.pre-commit-config.yaml`](https://github.com/tier4/autoware_lanelet2_to_opendrive/blob/master/.pre-commit-config.yaml))
-run automatically on every commit:
+This writes both the `pre-commit` and `pre-push` git hooks, because the config
+declares `default_install_hook_types: [pre-commit, pre-push]`.
+
+These hooks (see [`.pre-commit-config.yaml`](https://github.com/tier4/autoware_lanelet2_to_opendrive/blob/master/.pre-commit-config.yaml))
+run on every **commit**:
 
 - `pre-commit-hooks` v4.6.0: `trailing-whitespace`, `end-of-file-fixer`,
   `check-yaml` (excluding `mkdocs.yml`), `check-added-large-files`,
   `check-merge-conflict`, `check-toml`, `debug-statements`,
   `mixed-line-ending`
 - `ruff` v0.7.4 (`--fix`) and `ruff-format`
-- Local `mypy --ignore-missing-imports` over both workspace `src/` and
+- Local `mypy --ignore-missing-imports` over the package's `src/` and
   `test/` trees
-- Local `pytest --no-testmon` runs for each workspace member, executed in
-  separate processes to dodge a known shutdown-time crash in the
-  lanelet2 C++ bindings when both suites share an interpreter
+
+This runs on every **push** (`stages: [pre-push]`):
+
+- Local `pytest -o addopts= -n auto --no-testmon` over the package's test
+  suite
 
 Never bypass hooks with `--no-verify`. If a hook auto-fixes a file,
 re-stage with `git add -u` and commit again.
+
+### pytest options are opt-in
+
+`pyproject.toml` sets no `addopts`, so `pytest <node id>` runs exactly the
+tests named, serially. Add what you want per invocation:
+
+- `-n N` (pytest-xdist) to parallelise. Each worker converts and loads maps on
+  its own; on a 32 GB host keep `N` small when other suites or containers run.
+- `--testmon` to run only the tests affected by your changes since the last
+  testmon run. It **deselects** everything else, including tests you named on
+  the command line by file, so never use it to verify a red or a green, or to
+  claim a full-suite pass.
 
 ## Project Structure
 
@@ -92,7 +108,6 @@ autoware_lanelet2_to_opendrive/                 # repo root (uv workspace)
 │   │   ├── conf/                               # Hydra config (config.yaml, map/, target/)
 │   │   ├── types.py / util.py / py.typed
 │   └── test/                                   # pytest suite (testpaths in workspace pyproject)
-└── autoware_carla_scenario/                    # sister package
 ```
 
 ## Development Workflow

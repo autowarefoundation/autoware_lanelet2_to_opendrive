@@ -27,10 +27,11 @@ the single-sync approach is slightly larger but reliable.
 
 ## Architecture and CARLA
 
-CARLA only ships x86_64 wheels, so every service that needs it (`dev`,
-`pytest`, `lint`, `qc-validate`, `carla-import-test`, `convert`) pins
-`platform: linux/amd64` explicitly in `docker-compose.yml`. On Apple Silicon
-this necessarily runs under QEMU emulation.
+The `carla` extra (`typesafe-carla`, which provides the CARLA 0.10.0 client)
+publishes only an x86_64 wheel, so every service built from the `dev` or
+`convert` image (`dev`, `pytest`, `lint`, `qc-validate`, `carla-import-test`,
+`convert`) pins `platform: linux/amd64` explicitly in `docker-compose.yml`. On
+Apple Silicon this necessarily runs under QEMU emulation.
 
 `dev-nocarla` and its compose services (`dev-native`, `pytest-native`) carry
 no such pin: they build and run for the host's native architecture. On Apple
@@ -46,12 +47,10 @@ test-native`** for day-to-day iteration, and fall back to `--profile test`
 (the CI-equivalent, CARLA-inclusive, amd64 path) before opening a PR or after
 touching the CARLA code path.
 
-Because CARLA cannot be installed on the native target, `pytest-native`
-excludes the CARLA-dependent test modules from collection (13 at the time of
-writing) and prints the skip count in the run header, e.g. `carla not
-installed: 13 test modules ignored`. This is not a substitute for a full run:
-use `--profile test` for complete verification of any change to
-`autoware_carla_scenario`.
+No test module imports the CARLA client — only the `carla-import-test`
+entrypoint does — so `pytest-native` collects and runs the same tests as
+`pytest`. What it cannot exercise is `carla-import-test` itself: use
+`--profile carla` to verify any change to that code path.
 
 ## CI-equivalent local jobs
 
@@ -59,14 +58,13 @@ Each CI job has a matching compose service with the same command. Profiles
 prevent accidental `docker compose up` from starting anything.
 
 ```bash
-# Day-to-day test loop. Native architecture, no QEMU emulation. CARLA-dependent
-# modules are skipped automatically (skip count shown in the run header).
+# Day-to-day test loop. Native architecture, no QEMU emulation, no `carla`
+# extra installed.
 docker compose --profile test-native run --rm pytest-native
 
-# Full pytest suite including the CARLA-dependent modules (same as CI's `test`
-# job). Pinned to linux/amd64, so this runs under emulation -- and is much
-# slower -- on Apple Silicon. Use before opening a PR and whenever the CARLA
-# path changed.
+# Full pytest suite in the CI-equivalent image (same as CI's `test` job, with
+# the `carla` extra). Pinned to linux/amd64, so this runs under emulation --
+# and is much slower -- on Apple Silicon. Use before opening a PR.
 docker compose --profile test run --rm pytest
 
 # Run pre-commit on all files (same as CI's `lint-and-format` job)
@@ -213,10 +211,11 @@ docker compose --profile test-native run --rm pytest-native uname -m   # expect 
 If it is set, `unset DOCKER_DEFAULT_PLATFORM` in the current shell (and check
 your shell's rc files and history for where it came from).
 
-### `No matching distribution found for carla`
+### `uv sync --extra carla` fails building `typesafe-carla` on arm64
 
-This means a CARLA-requiring service was built without its `linux/amd64` pin
-on an arm64 host. Check that `docker-compose.yml` still has
+`typesafe-carla` publishes only an x86_64 wheel, so on an arm64 host `uv`
+has no wheel to install and falls back to the source distribution. This means a
+CARLA-requiring service was built without its `linux/amd64` pin. Check that `docker-compose.yml` still has
 `platform: linux/amd64` on the affected service — it must not be removed.
 
 ### Fewer `pytest-xdist` workers than expected
@@ -227,24 +226,6 @@ runtime's VM CPU allocation (e.g. Rancher Desktop: `rdctl set
 In this repository's suite the effect is limited: the current bottleneck is
 one long-running test executed serially, not worker count (see "Architecture
 and CARLA" above).
-
-### The first `pytest-native` run pauses on `uv run convert`
-
-The session-scoped `_ensure_nishishinjuku_xodr` fixture in
-`autoware_carla_scenario/test/conftest.py` regenerates
-`nishishinjuku_carla.xodr` with `uv run convert` when that file is missing.
-`uv run` performs an implicit sync against the bind-mounted source, which is
-the behaviour the note further up this page warns about.
-
-In the run we measured, this happened and cost no visible rebuild time: the
-image's virtualenv already matched the lockfile, so the implicit sync was a
-no-op. **That is not guaranteed in general.** A full native rebuild of the
-workspace's C++ dependencies is still possible — most likely right after
-`uv.lock` changes, or when re-running `pytest-native` against a venv volume
-that predates the current image.
-
-If the first run stalls on dependency builds, generate the XODR on the host
-(or run the `convert` profile once) before invoking `pytest-native`.
 
 ### Pre-commit fails with `Is it installed, and are you in a Git repository directory?`
 

@@ -3,7 +3,8 @@ x-carla-base: &carla-base
     context: .
     target: dev
   image: l2o-dev:local
-  # CARLA ships x86_64-only wheels, so every CARLA-dependent service pins
+  # The `carla` extra (typesafe-carla, the CARLA 0.10.0 client) publishes
+  # only an x86_64 wheel, so every service built on the `dev` image pins
   # linux/amd64 explicitly. This must not rely on a developer's
   # DOCKER_DEFAULT_PLATFORM environment variable (see docs/docker.md): on
   # Apple Silicon this forces QEMU emulation, but it keeps `uv sync --extra
@@ -60,22 +61,15 @@ services:
   # destabilize the carefully-built native dependencies in the image.
   pytest:
     <<: *carla-base
-    # `-o addopts=` disables the `--testmon` default from pyproject.toml.
-    # .testmondata is written to the bind-mounted repo root, so it is shared
-    # across this (amd64) service, pytest-native (arm64), and the host. Mixed
-    # architectures in one testmon history can select stale results and
-    # silently run nothing; forcing a full run here keeps this service
-    # aligned with CI (.github/workflows/ci.yml).
-    command: pytest -v --tb=short -n auto -o addopts=
+    command: pytest -v --tb=short -n auto
     profiles: ["test"]
 
   pytest-native:
     <<: *native-base
-    # See the `pytest` service above for why `-o addopts=` is required here
-    # too. CARLA-dependent test modules are skipped automatically (see
-    # autoware_carla_scenario/test/carla_scenario/conftest.py); the skip
-    # count is printed in the pytest run header.
-    command: pytest -v --tb=short -n auto -o addopts=
+    # No test module imports the CARLA client (only the `carla-import-test`
+    # entrypoint does), so the suite collects and runs in full without the
+    # `carla` extra. Use the `carla` profile to exercise the CARLA path.
+    command: pytest -v --tb=short -n auto
     profiles: ["test-native"]
 
   qc-validate:
