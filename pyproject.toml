@@ -20,6 +20,10 @@ dev = [
     "mkdocstrings[python]>=0.27.0",
     "mypy>=1.19.0",
     "pre-commit>=4.5.0",
+    # Used only by the TransverseMercator round-trip test (issue #541) to
+    # independently verify the PROJ string produced by
+    # latlon_to_tmerc_proj_string(); not used by production conversion code.
+    "pyproj>=3.6",
     "pytest>=9.0.3",
     "pytest-testmon>=2.2.0",
     "pytest-xdist>=3.8.0",

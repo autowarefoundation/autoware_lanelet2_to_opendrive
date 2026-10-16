@@ -24,6 +24,7 @@ from autoware_lanelet2_extension_python.projection import (
 )
 from omegaconf import DictConfig
 
+from .config import DEFAULT_CONFIG
 from .conversion_config import OriginSpec
 from .map_projector_info import MAP_PROJECTOR_INFO_FILENAME, MapProjectorInfo
 from .projection import (
@@ -37,6 +38,11 @@ from .projection import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: ``projector_type`` values are matched case-sensitively, exactly as
+#: Autoware's ``map_projection_loader`` writes and compares them.
+_MGRS = "MGRS"
+_TRANSVERSE_MERCATOR = "TransverseMercator"
 
 
 def geo_reference_for_origin(origin_spec: OriginSpec) -> str:
@@ -81,8 +87,8 @@ class ResolvedProjection:
     scale_factor: Optional[float] = None
     projector_type: str = "MGRS"
 
-    def make_projector(self):
-        if self.projector_type == "TransverseMercator":
+    def make_projector(self) -> "MGRSProjector | TransverseMercatorProjector":
+        if self.projector_type == _TRANSVERSE_MERCATOR:
             return TransverseMercatorProjector(self.origin, self.scale_factor)
         return MGRSProjector(self.origin)
 
@@ -103,7 +109,7 @@ class ResolvedProjection:
 
     @property
     def geo_reference(self) -> str:
-        if self.projector_type == "TransverseMercator":
+        if self.projector_type == _TRANSVERSE_MERCATOR:
             return latlon_to_tmerc_proj_string(
                 self.origin_lat, self.origin_lon, self.scale_factor
             )
@@ -247,10 +253,12 @@ def _resolve_transverse_mercator(
 ) -> ResolvedProjection:
     """Build a :class:`ResolvedProjection` for ``projector_type: TransverseMercator``.
 
-    Any positive ``scale_factor`` is accepted: the Autoware Python binding
-    for ``TransverseMercatorProjector`` accepts an explicit ``scale_factor``
-    argument (defaulting to ``0.9996``), so it is threaded straight through
-    to the projector.
+    ``scale_factor`` is optional. When absent it defaults to
+    ``DEFAULT_CONFIG.projection.transverse_mercator_default_scale_factor``
+    (0.9996): real Autoware TransverseMercator yamls usually omit it, and
+    Autoware's projector uses ``GeographicLib::TransverseMercator::UTM()``
+    (k0 = 0.9996). Any positive, finite ``scale_factor`` is accepted and
+    threaded straight through to the ``TransverseMercatorProjector`` binding.
 
     Args:
         info_path: Path to the ``map_projector_info.yaml`` file (for error
@@ -261,7 +269,7 @@ def _resolve_transverse_mercator(
         A :class:`ResolvedProjection` with ``projector_type="TransverseMercator"``.
 
     Raises:
-        ValueError: If ``map_origin`` or ``scale_factor`` is missing, or if
+        ValueError: If ``map_origin`` is missing, or if a present
             ``scale_factor`` is not a positive, finite number.
     """
     if info.map_origin is None:
@@ -272,12 +280,11 @@ def _resolve_transverse_mercator(
     origin_lat = info.map_origin.latitude
     origin_lon = info.map_origin.longitude
 
-    if info.scale_factor is None:
-        raise ValueError(
-            f"{info_path}: projector_type 'TransverseMercator' requires a "
-            "'scale_factor' field"
-        )
-    scale_factor = info.scale_factor
+    scale_factor = (
+        DEFAULT_CONFIG.projection.transverse_mercator_default_scale_factor
+        if info.scale_factor is None
+        else info.scale_factor
+    )
     if not (math.isfinite(scale_factor) and scale_factor > 0):
         raise ValueError(
             f"{info_path}: TransverseMercator scale_factor={scale_factor!r} must be "
@@ -291,7 +298,7 @@ def _resolve_transverse_mercator(
         origin_lat=origin_lat,
         origin_lon=origin_lon,
         scale_factor=scale_factor,
-        projector_type="TransverseMercator",
+        projector_type=_TRANSVERSE_MERCATOR,
     )
 
 
@@ -315,12 +322,14 @@ def _resolve_from_map_projector_info(info_path: Path) -> Optional[ResolvedProjec
         ValueError: If the file is malformed (see
             :meth:`MapProjectorInfo.from_yaml`), if ``projector_type`` is
             MGRS but ``mgrs_grid`` is missing, or if ``projector_type`` is
-            TransverseMercator but ``map_origin``/``scale_factor`` are
-            missing (see :func:`_resolve_transverse_mercator`).
+            TransverseMercator but ``map_origin`` is missing or
+            ``scale_factor`` is invalid (see
+            :func:`_resolve_transverse_mercator`). ``projector_type`` is
+            matched case-sensitively, as Autoware writes it.
     """
     info = MapProjectorInfo.from_yaml(info_path)
 
-    if info.projector_type.upper() == "MGRS":
+    if info.projector_type == _MGRS:
         if info.mgrs_grid is None:
             raise ValueError(
                 f"{info_path}: projector_type 'MGRS' requires a 'mgrs_grid' field"
@@ -336,7 +345,7 @@ def _resolve_from_map_projector_info(info_path: Path) -> Optional[ResolvedProjec
             origin_lon=origin_lon,
         )
 
-    if info.projector_type == "TransverseMercator":
+    if info.projector_type == _TRANSVERSE_MERCATOR:
         return _resolve_transverse_mercator(info_path, info)
 
     logger.warning(
