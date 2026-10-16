@@ -74,6 +74,16 @@ class SplineConstants:
         control_points_ratio: Ratio of control points to input points (base calculation)
         curvature_threshold: Threshold for high curvature detection (radians)
         curvature_multiplier: Multiplier for control points in high curvature regions
+        endpoint_pin_weight: Hard-constraint weight used instead of
+            ``hard_constraint_weight`` when a reference-line endpoint position
+            or heading is pinned (junction contact).  Gives sub-millimetre
+            endpoint accuracy; much larger values (e.g. 1e6) distort the
+            interior fit enough to confuse the lanelet-to-road matcher.
+        max_heading_override_rad: Largest angle (radians, default ~20 deg)
+            by which a pinned endpoint heading may differ from the
+            reference line's own boundary tangent.  Beyond it the heading
+            pin is dropped for that end (the position pin is kept), since
+            forcing it would bend a short connector into an S-curve.
         resample_spacing: Maximum spacing (m) between consecutive input points
             handed to the reference-line spline fitter. Raw Lanelet2
             boundaries are digitised with an arbitrary vertex density -- gaps
@@ -106,6 +116,8 @@ class SplineConstants:
     control_points_ratio: float = 0.4
     curvature_threshold: float = 0.2
     curvature_multiplier: float = 1.5
+    endpoint_pin_weight: float = 1e4
+    max_heading_override_rad: float = 0.35
     resample_spacing: float = 1.0
 
 

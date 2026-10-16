@@ -19,6 +19,33 @@ from .lane_elements import LaneWidth, road_mark_from_linestring_attrs
 
 logger = logging.getLogger(__name__)
 
+
+def _guard_heading_override(
+    hdg_override: Optional[float], own_vel: np.ndarray, end_name: str
+) -> Optional[float]:
+    """Drop a heading override that strays too far from the boundary's tangent.
+
+    Returns ``hdg_override`` unchanged when it lies within
+    ``SplineConstants.max_heading_override_rad`` of ``own_vel``'s direction,
+    and ``None`` otherwise so the fit falls back to its own tangent.
+    """
+    if hdg_override is None:
+        return None
+    own_hdg = float(np.arctan2(own_vel[1], own_vel[0]))
+    dpsi = abs((hdg_override - own_hdg + np.pi) % (2.0 * np.pi) - np.pi)
+    limit = DEFAULT_CONFIG.spline.max_heading_override_rad
+    if dpsi > limit:
+        logger.debug(
+            "Ignoring %s heading override: %.2f deg from the boundary tangent "
+            "(limit %.2f deg); keeping the position pin only",
+            end_name,
+            np.degrees(dpsi),
+            np.degrees(limit),
+        )
+        return None
+    return hdg_override
+
+
 if TYPE_CHECKING:
     pass
 
@@ -117,6 +144,8 @@ class ReferenceLine:
         routing_graph: Optional[RoutingGraph] = None,
         start_xyz_override: Optional[Tuple[float, float, float]] = None,
         end_xyz_override: Optional[Tuple[float, float, float]] = None,
+        start_hdg_override: Optional[float] = None,
+        end_hdg_override: Optional[float] = None,
     ) -> "ReferenceLine":
         """
         Construct a ReferenceLine from a group of Lanelet2 lanelets.
@@ -135,12 +164,22 @@ class ReferenceLine:
                 replaces the first sampled point of the reference line before
                 spline fitting.  Used by the junction phase to pin a
                 connecting road's s=0 endpoint to the incoming road's
-                endpoint (P0-2 junction endpoint fidelity).
+                endpoint (junction endpoint fidelity).
             end_xyz_override: Optional (x, y, z) world-frame coordinate that
                 replaces the last sampled point of the reference line before
                 spline fitting.  Used by the junction phase to pin a
                 connecting road's s=length endpoint to the outgoing road's
                 endpoint.
+            start_hdg_override: Optional world-frame tangent angle (radians)
+                that replaces the *direction* of the fitted spline's s=0
+                boundary constraint.  The position override above makes the
+                connecting road start at the right point; without this it
+                then leaves along its own lanelet's tangent, and OpenDRIVE
+                lane borders (``reference(s) + t * normal(s)``) fan out from
+                the shared point by ``2 * w * sin(dpsi / 2)`` — the whole of
+                the residual ``lane_smoothness`` gap at junction boundaries.
+            end_hdg_override: The s=length counterpart of
+                ``start_hdg_override``.
 
         Returns:
             ReferenceLine instance constructed from the center of the lanelet group
@@ -252,7 +291,7 @@ class ReferenceLine:
                         f"LHT rightBound direction is correct (dot product={dot_product:.4f})"
                     )
 
-        # Apply world-frame endpoint overrides (P0-2 junction endpoint fidelity).
+        # Apply world-frame endpoint overrides (junction endpoint fidelity).
         # These are set by the junction phase so that a connecting road's first
         # and last points become exactly the world-frame endpoint of the
         # linked incoming / outgoing road reference line.  The spline fitter
@@ -312,8 +351,31 @@ class ReferenceLine:
             start_vel, end_vel = -end_vel, -start_vel
             logger.debug("Reversed velocity vectors to match reversed boundary points")
 
+        # Apply the heading overrides (direction half of the junction contact
+        # contract).  These must come *after* the reversal above: they are
+        # stated in the frame of the emitted reference line, which is what
+        # ``boundary_reversed`` has just settled.  ``Splines`` scales its
+        # velocity targets by ``t_max`` internally and its own estimates are
+        # unit vectors, so a unit vector is the right magnitude to hand it.
+        # An override too far from the boundary's own tangent is dropped
+        # (the position pin stays): forcing it would bend the line into an
+        # S-curve, which is worse than the border gap it would close.
+        start_hdg_override = _guard_heading_override(
+            start_hdg_override, start_vel, "start"
+        )
+        end_hdg_override = _guard_heading_override(end_hdg_override, end_vel, "end")
+        if start_hdg_override is not None:
+            start_vel = np.array(
+                [np.cos(start_hdg_override), np.sin(start_hdg_override)],
+                dtype=float,
+            )
+        if end_hdg_override is not None:
+            end_vel = np.array(
+                [np.cos(end_hdg_override), np.sin(end_hdg_override)], dtype=float
+            )
+
         # Create B-spline directly from corrected points.  When the caller
-        # overrode start/end points (junction endpoint fidelity, P0-2) the
+        # overrode start/end points (junction endpoint fidelity) the
         # override point can be up to a few decimetres away from the second
         # or second-to-last input point.  With the default weight mix
         # (hard=80, soft=20) the LSQ solver trades ~10-20 cm of boundary
@@ -326,10 +388,17 @@ class ReferenceLine:
         # boundaries against the rendered road geometry and a too-aggressive
         # weight (e.g. 1e6) shifts neighbouring lanelets to a different
         # road in the matching, breaking conversion-vs-geo cross-validation.
-        # 1e4 gives sub-millimetre endpoint accuracy while keeping the
-        # interior within ~1 cm of the default-weight fit.
-        has_override = start_xyz_override is not None or end_xyz_override is not None
-        spline_hard_weight: Optional[float] = 1e4 if has_override else None
+        # ``endpoint_pin_weight`` (1e4) gives sub-millimetre endpoint accuracy
+        # while keeping the interior within ~1 cm of the default-weight fit.
+        has_override = (
+            start_xyz_override is not None
+            or end_xyz_override is not None
+            or start_hdg_override is not None
+            or end_hdg_override is not None
+        )
+        spline_hard_weight: Optional[float] = (
+            DEFAULT_CONFIG.spline.endpoint_pin_weight if has_override else None
+        )
         centerline_2d = Splines(
             points_3d[:, :2],  # Use corrected XY points
             start_vel=start_vel,
