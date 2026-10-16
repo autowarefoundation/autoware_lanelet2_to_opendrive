@@ -129,10 +129,14 @@ def _resolve_candidate_road_ids(
     if has_real_junction:
         return []
     seen: List[int] = []
+    # ``seen_ids`` mirrors ``seen`` purely to keep the membership test O(1);
+    # ``seen`` remains the ordered result.
+    seen_ids: Set[int] = set()
     for group in groups:
         for ll in group:
             rid = mapping.get(ll.id)
-            if rid is not None and rid not in seen:
+            if rid is not None and rid not in seen_ids:
+                seen_ids.add(rid)
                 seen.append(rid)
     return seen
 
@@ -1311,15 +1315,23 @@ class Road:
         # Filter out lanelets inside junctions
         from ..junction import _filter_lanelets_outside_junction
 
-        # Include non-road subtypes (highway, walkway, road_shoulder) so they can
-        # be emitted with the correct OpenDRIVE lane type
+        # Include non-road subtypes so they can be emitted with the correct
+        # OpenDRIVE lane type
         # (see Lane.construct_from_lanelet for the subtype -> LaneType mapping).
         # Different subtypes form separate adjacent groups because the routing
         # graph treats them as different participant classes, so e.g. walkways
         # will not be grouped together with road lanelets here.
         road_lanelets = _filter_lanelets_outside_junction(
             filter_lanelets_by_subtype(
-                all_lanelets, ["road", "highway", "walkway", "road_shoulder"]
+                all_lanelets,
+                [
+                    "road",
+                    "highway",
+                    "walkway",
+                    "pedestrian_lane",
+                    "road_shoulder",
+                    "bicycle_lane",
+                ],
             )
         )
 
@@ -1651,9 +1663,12 @@ class Road:
         ):
             # Issue #132 fix: Apply offset to junction ID
             junction_id = junction_index + junction_id_offset
-            # Find adjacent groups within this junction
+            # Find adjacent groups within this junction.  Hand over the
+            # routing graph built above: without it ``find_adjacent_groups``
+            # rebuilds a whole-map graph on every iteration, which dominates
+            # junction construction on large maps.
             adjacent_groups_in_junction = find_adjacent_groups(
-                lanelet_map, set(junction_group)
+                lanelet_map, set(junction_group), routing_graph
             )
 
             junction_road_ids = []
@@ -1841,6 +1856,7 @@ class Road:
         connecting_roads: List["Road"],
         lanelet_to_road_id: Dict[int, int],
         road_to_lanelet_ids: Dict[int, List[int]],
+        routing_graph: Optional[RoutingGraph] = None,
     ) -> None:
         """Set predecessor/successor links for connecting roads inside junctions.
 
@@ -1857,14 +1873,17 @@ class Road:
             connecting_roads: List of roads inside junctions (junction >= 0)
             lanelet_to_road_id: Mapping from lanelet ID to road ID for ALL lanelets
             road_to_lanelet_ids: Mapping from road ID to list of lanelet IDs
+            routing_graph: Optional pre-built routing graph. If None, creates a new one.
         """
-        traffic_rules = lanelet2.traffic_rules.create(
-            lanelet2.traffic_rules.Locations.Germany,
-            lanelet2.traffic_rules.Participants.Vehicle,
-        )
-        routing_graph = RoutingGraph(
-            lanelet_map, traffic_rules, [RoutingCostDistance(0.0)]
-        )
+        # Use provided routing graph or create a new one
+        if routing_graph is None:
+            traffic_rules = lanelet2.traffic_rules.create(
+                lanelet2.traffic_rules.Locations.Germany,
+                lanelet2.traffic_rules.Participants.Vehicle,
+            )
+            routing_graph = RoutingGraph(
+                lanelet_map, traffic_rules, [RoutingCostDistance(0.0)]
+            )
 
         # Get junction lanelet IDs (all lanelets belonging to connecting roads)
         junction_lanelet_ids: set[int] = set()
