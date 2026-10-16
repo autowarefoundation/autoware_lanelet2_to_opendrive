@@ -287,6 +287,14 @@ def find_connecting_lanelet_groups(
         for connected_ll in connections:
             connecting_lanelets.add(connected_ll)
 
+    # No connections at all means there is nothing to group. Returning early is
+    # required for correctness as well as speed: find_adjacent_groups treats an
+    # empty target set as "group every lanelet in the map", so forwarding an
+    # empty set here would report the whole map as connecting groups and make
+    # every dead-end lanelet group pay for a full-map traversal.
+    if not connecting_lanelets:
+        return []
+
     # Group the connecting lanelets by their adjacency
     groups = find_adjacent_groups(lanelet_map, connecting_lanelets, routing_graph)
 
@@ -312,11 +320,13 @@ def find_adjacent_groups(
     Returns:
         List of sets, where each set contains lanelets that are laterally adjacent to each other
     """
-    all_lanelets_in_map = set(lanelet_map.laneletLayer)
-
-    # If target_lanelets is empty, use all lanelets from the map
+    # If target_lanelets is empty, use all lanelets from the map.
+    # The full-map set is materialised only in that branch: on large maps it
+    # is tens of thousands of elements, and every caller that passes a
+    # non-empty ``target_lanelets`` (junction / divergence grouping, called
+    # once per site) never reads it.
     if not target_lanelets:
-        lanelets_to_group = all_lanelets_in_map
+        lanelets_to_group = set(lanelet_map.laneletLayer)
     else:
         # Use only the target lanelets without adding adjacent ones from other groups
         # The adjacency relationships will be found in the DFS below
@@ -525,7 +535,9 @@ CONVERTIBLE_LANELET_SUBTYPES: List[str] = [
     "road",
     "highway",
     "walkway",
+    "pedestrian_lane",
     "road_shoulder",
+    "bicycle_lane",
 ]
 
 
