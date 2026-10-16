@@ -87,6 +87,9 @@ class LaneSection:
         start_xyz_override: Optional[Tuple[float, float, float]] = None,
         end_xyz_override: Optional[Tuple[float, float, float]] = None,
         offset: CoordinateOffset = CoordinateOffset(),
+        start_hdg_override: Optional[float] = None,
+        end_hdg_override: Optional[float] = None,
+        reference_line: Optional[ReferenceLine] = None,
     ) -> "LaneSection":
         """
         Construct a LaneSection from a group of Lanelet2 lanelets.
@@ -102,11 +105,21 @@ class LaneSection:
             start_xyz_override: Optional world-frame (x, y, z) coordinate that
                 pins the reference line start.  Mirrors the override on
                 ``Road.construct_from_lanelet_groups`` and is also forwarded
-                to the OUTERMOST lane's width calculation (P0-2 junction
-                endpoint fidelity, lane-width side).
+                to the OUTERMOST lane's width calculation (junction endpoint
+                fidelity, lane-width side).
             end_xyz_override: Optional analogous override for the s=length end.
             offset: Coordinate offset to subtract from extracted boundary
                 points. Defaults to a zero offset.
+            start_hdg_override: Optional world-frame tangent angle (radians)
+                pinning the reference line direction at s=0.  Mirrors the
+                override on ``Road.construct_from_lanelet_groups``.
+            end_hdg_override: The s=length counterpart of
+                ``start_hdg_override``.
+            reference_line: Optional already-fitted reference line to use as
+                the centre lane.  ``Road.construct_from_lanelet_groups``
+                passes the planView's own reference line so lane widths are
+                sampled on exactly the curve the planView emits.  When
+                ``None`` one is fitted here from the overrides above.
 
         Returns:
             LaneSection instance constructed from the lanelet group
@@ -140,18 +153,21 @@ class LaneSection:
         sorted_lanelets = sort_adjacent_groups(lanelet_map, lanelet_set, routing_graph)
 
         # Create and set the reference line.  When the caller supplies
-        # endpoint overrides (junction endpoint pinning, P0-2) the centre
-        # lane must use the SAME pinned spline as the road's planView so
-        # width s-coordinates and total length agree.
-        reference_line = ReferenceLine.construct_from_lanelet_groups(
-            lanelet_map,
-            lanelet_group,
-            traffic_rule=traffic_rule,
-            routing_graph=routing_graph,
-            start_xyz_override=start_xyz_override,
-            end_xyz_override=end_xyz_override,
-            offset=offset,
-        )
+        # endpoint overrides (junction endpoint pinning) the centre lane
+        # must use the SAME pinned spline as the road's planView so width
+        # s-coordinates, tangents and total length agree.
+        if reference_line is None:
+            reference_line = ReferenceLine.construct_from_lanelet_groups(
+                lanelet_map,
+                lanelet_group,
+                traffic_rule=traffic_rule,
+                routing_graph=routing_graph,
+                start_xyz_override=start_xyz_override,
+                end_xyz_override=end_xyz_override,
+                start_hdg_override=start_hdg_override,
+                end_hdg_override=end_hdg_override,
+                offset=offset,
+            )
         lane_section._set_center_lane(reference_line)
 
         # Normalize traffic_rule to uppercase, default to RHT
