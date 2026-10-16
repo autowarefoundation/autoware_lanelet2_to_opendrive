@@ -1,8 +1,15 @@
-x-dev-base: &dev-base
+x-carla-base: &carla-base
   build:
     context: .
     target: dev
   image: l2o-dev:local
+  # The `carla` extra (typesafe-carla, the CARLA 0.10.0 client) publishes
+  # only an x86_64 wheel, so every service built on the `dev` image pins
+  # linux/amd64 explicitly. This must not rely on a developer's
+  # DOCKER_DEFAULT_PLATFORM environment variable (see docs/docker.md): on
+  # Apple Silicon this forces QEMU emulation, but it keeps `uv sync --extra
+  # carla` working regardless of host architecture.
+  platform: linux/amd64
   volumes:
     - .:/workspace
     # Isolate the container's .venv from the host so the host-side
@@ -14,11 +21,38 @@ x-dev-base: &dev-base
     - ${GIT_COMMON_DIR:-/tmp/l2o-git-common-dir-unset}:${GIT_COMMON_DIR:-/tmp/l2o-git-common-dir-unset}
   working_dir: /workspace
 
+x-native-base: &native-base
+  build:
+    context: .
+    target: dev-nocarla
+  image: l2o-dev-nocarla:local
+  # Deliberately no `platform:` here: these services build and run for the
+  # host's native architecture (arm64 on Apple Silicon, avoiding QEMU
+  # emulation). Do not add `platform: linux/amd64` to this anchor.
+  volumes:
+    - .:/workspace
+    # Separate cache volumes from the carla-based services: the two venvs
+    # differ in both dependency set and architecture, and sharing a named
+    # volume between them reproduces the `SystemError: initialization`
+    # class of failure documented in docs/docker.md.
+    - venv-nocarla-cache:/workspace/.venv
+    - uv-nocarla-cache:/root/.cache/uv
+    # Same worktree fix as carla-base above (see
+    # docs/docker.md#running-from-a-git-worktree). The native services are
+    # the day-to-day path, so they need this at least as much as carla-base.
+    - ${GIT_COMMON_DIR:-/tmp/l2o-git-common-dir-unset}:${GIT_COMMON_DIR:-/tmp/l2o-git-common-dir-unset}
+  working_dir: /workspace
+
 services:
   dev:
-    <<: *dev-base
+    <<: *carla-base
     command: bash
     profiles: ["dev"]
+
+  dev-native:
+    <<: *native-base
+    command: bash
+    profiles: ["dev-native"]
 
   # CI-equivalent jobs invoke entrypoints directly from the venv (PATH already
   # contains /workspace/.venv/bin via the image ENV). We deliberately avoid
@@ -26,12 +60,20 @@ services:
   # source on every invocation, which can rebuild workspace packages and
   # destabilize the carefully-built native dependencies in the image.
   pytest:
-    <<: *dev-base
+    <<: *carla-base
     command: pytest -v --tb=short -n auto
     profiles: ["test"]
 
+  pytest-native:
+    <<: *native-base
+    # No test module imports the CARLA client (only the `carla-import-test`
+    # entrypoint does), so the suite collects and runs in full without the
+    # `carla` extra. Use the `carla` profile to exercise the CARLA path.
+    command: pytest -v --tb=short -n auto
+    profiles: ["test-native"]
+
   qc-validate:
-    <<: *dev-base
+    <<: *carla-base
     command:
       - bash
       - -lc
@@ -44,7 +86,7 @@ services:
     profiles: ["qc"]
 
   carla-import-test:
-    <<: *dev-base
+    <<: *carla-base
     command:
       - bash
       - -lc
@@ -60,7 +102,7 @@ services:
     profiles: ["carla"]
 
   lint:
-    <<: *dev-base
+    <<: *carla-base
     command: pre-commit run --all-files
     profiles: ["lint"]
 
@@ -68,6 +110,10 @@ services:
     build:
       context: .
       target: convert
+    # `convert` copies the venv from the CARLA-enabled `deps` stage
+    # (`COPY --from=deps` in the Dockerfile), so it needs the same
+    # linux/amd64 pin as the carla-base services above.
+    platform: linux/amd64
     image: l2o-convert:local
     volumes:
       - ./io:/io
@@ -76,3 +122,5 @@ services:
 volumes:
   uv-cache:
   venv-cache:
+  uv-nocarla-cache:
+  venv-nocarla-cache:
