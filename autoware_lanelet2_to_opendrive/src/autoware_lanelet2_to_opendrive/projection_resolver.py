@@ -46,19 +46,42 @@ _MGRS = "MGRS"
 _TRANSVERSE_MERCATOR = "TransverseMercator"
 
 
+def _mgrs_geo_reference(mgrs_code: str, offset_x: float, offset_y: float) -> str:
+    """Build the geoReference for an MGRS grid square plus an optional offset.
+
+    Without an offset, ``mgrs_code`` is the exact, authoritative grid square
+    and is used directly. Re-deriving the grid from its own south-west corner
+    via lat/lon sits exactly on a grid boundary and can round to the
+    neighboring square, breaking frame consistency between the mgrs_grid and
+    lat_lon origin specs (issue #550).
+
+    With an offset, it is folded directly into the grid square's UTM corner
+    instead of going through a lat/lon derived via
+    ``mgrs_grid_with_offset_to_latlon``, which truncates the offset to whole
+    meters (a ~1m error). The exported coordinates, which ``MGRSProjector``
+    computes independently of the projector's origin, are unaffected.
+    """
+    if offset_x == 0.0 and offset_y == 0.0:
+        return mgrs_to_proj_string(mgrs_code)
+    return mgrs_grid_with_offset_to_proj_string(mgrs_code, offset_x, offset_y)
+
+
 def geo_reference_for_origin(origin_spec: OriginSpec) -> str:
     """Build the OpenDRIVE geoReference PROJ string for an origin spec.
 
-    Prefers ``lat``/``lon`` (set for lat/lon origins and for MGRS + offset) and
-    falls back to ``mgrs_code`` (the grid square's south-west corner).
+    Prefers ``mgrs_code`` (with ``offset_x``/``offset_y`` folded in, so the
+    frame matches the offset-subtracted coordinates that are exported) and
+    falls back to ``lat``/``lon`` for lat/lon origins.
 
     Raises:
-        ValueError: If neither lat/lon nor mgrs_code is set.
+        ValueError: If neither mgrs_code nor lat/lon is set.
     """
+    if origin_spec.mgrs_code is not None:
+        return _mgrs_geo_reference(
+            origin_spec.mgrs_code, origin_spec.offset_x, origin_spec.offset_y
+        )
     if origin_spec.lat is not None and origin_spec.lon is not None:
         return latlon_to_proj_string(origin_spec.lat, origin_spec.lon)
-    if origin_spec.mgrs_code is not None:
-        return mgrs_to_proj_string(origin_spec.mgrs_code)
     raise ValueError(
         "Cannot generate geoReference: config.origin must have lat/lon "
         "or mgrs_code set."
@@ -115,27 +138,7 @@ class ResolvedProjection:
                 self.origin_lat, self.origin_lon, self.scale_factor
             )
         if self.mgrs_code is not None:
-            if self.offset_x == 0.0 and self.offset_y == 0.0:
-                # No offset: mgrs_code is the exact, authoritative grid
-                # square, so use it directly. Falling through to
-                # geo_reference_for_origin would prefer origin_lat/origin_lon
-                # instead (see its docstring), which for this case is the
-                # grid square's own south-west corner -- a point that sits
-                # exactly on a grid boundary. Re-deriving the grid from that
-                # corner via latlon_to_proj_string can round to the
-                # neighboring square, breaking frame consistency between the
-                # mgrs_grid and lat_lon origin specs (issue #550).
-                return mgrs_to_proj_string(self.mgrs_code)
-            # Offset present: fold it directly into the grid square's UTM
-            # corner instead of going through origin_lat/origin_lon, which
-            # are derived via mgrs_grid_with_offset_to_latlon and truncate
-            # the offset to whole meters (a ~1m error). This keeps
-            # geoReference exact while leaving origin_lat/origin_lon (and
-            # thus the actual exported coordinates, which MGRSProjector
-            # computes independently of the projector's origin) unchanged.
-            return mgrs_grid_with_offset_to_proj_string(
-                self.mgrs_code, self.offset_x, self.offset_y
-            )
+            return _mgrs_geo_reference(self.mgrs_code, self.offset_x, self.offset_y)
         return geo_reference_for_origin(self.to_origin_spec())
 
 

@@ -42,6 +42,26 @@ def _normalize_mgrs_grid(mgrs_grid: str) -> str:
     return processed_mgrs
 
 
+def _mgrs_grid_square_utm(mgrs_grid: str) -> tuple[int, str, float, float]:
+    """Return the UTM zone, hemisphere and south-west corner of a 100 km square.
+
+    Any in-square digits (e.g. the ``1234567890`` of ``"54SUE1234567890"``)
+    are discarded: ``MGRSProjector`` emits coordinates relative to the grid
+    square's corner, never to a point inside it, so the frame must be
+    anchored there regardless of how precisely the grid was written.
+
+    Raises:
+        ValueError: If ``mgrs_grid`` does not start with a grid square ID.
+    """
+    match = re.match(r"^(\d+[A-Z]{3})", mgrs_grid.strip())
+    if not match:
+        raise ValueError(f"Invalid MGRS format: {mgrs_grid}")
+    zone, hemisphere, grid_easting, grid_northing = mgrs.MGRS().MGRSToUTM(
+        _normalize_mgrs_grid(match.group(1))
+    )
+    return zone, hemisphere, grid_easting, grid_northing
+
+
 def _utm_central_meridian(zone: int) -> float:
     """Return the central meridian (decimal degrees) of a UTM zone."""
     return (zone - 1) * 6 - 180 + 3
@@ -253,9 +273,7 @@ def mgrs_to_proj_string(mgrs_grid: str) -> str:
         '+proj=tmerc +lat_0=0 +lon_0=141 +k_0=0.9996 +x_0=200000.0 +y_0=-3900000.0 +datum=WGS84 +units=m +no_defs'
     """
     try:
-        processed_mgrs = _normalize_mgrs_grid(mgrs_grid)
-        m = mgrs.MGRS()
-        zone, hemisphere, grid_easting, grid_northing = m.MGRSToUTM(processed_mgrs)
+        zone, hemisphere, grid_easting, grid_northing = _mgrs_grid_square_utm(mgrs_grid)
 
         proj_string = _build_mgrs_frame_proj_string(
             zone, hemisphere == "S", grid_easting, grid_northing
@@ -302,9 +320,7 @@ def mgrs_grid_with_offset_to_proj_string(
         ValueError: If the MGRS grid string is invalid.
     """
     try:
-        processed_mgrs = _normalize_mgrs_grid(mgrs_grid)
-        m = mgrs.MGRS()
-        zone, hemisphere, grid_easting, grid_northing = m.MGRSToUTM(processed_mgrs)
+        zone, hemisphere, grid_easting, grid_northing = _mgrs_grid_square_utm(mgrs_grid)
 
         proj_string = _build_mgrs_frame_proj_string(
             zone,

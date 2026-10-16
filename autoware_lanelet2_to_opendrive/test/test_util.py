@@ -949,7 +949,7 @@ def test_latlon_to_proj_string_utm_zone_calculation():
 
     # Zone 31: 0 to 6 (e.g., lon=3 should be zone 31, central meridian 3)
     proj_zone31 = latlon_to_proj_string(45.0, 3.0)
-    assert "+lon_0=3" in proj_zone31
+    assert "+lon_0=3 " in proj_zone31
 
     # Zone 60: 174 to 180 (e.g., lon=177 should be zone 60, central meridian 177)
     proj_zone60 = latlon_to_proj_string(0.0, 177.0)

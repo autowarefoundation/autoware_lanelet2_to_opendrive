@@ -138,14 +138,23 @@ def test_resolve_rejects_offset_without_mgrs_grid():
 # ---------------------------------------------------------------------------
 
 
-def test_geo_reference_prefers_lat_lon():
-    spec = OriginSpec(mgrs_code="54SUE", lat=35.6895, lon=139.6917)
+def test_geo_reference_uses_lat_lon_without_mgrs_code():
+    spec = OriginSpec(lat=35.6895, lon=139.6917)
     assert geo_reference_for_origin(spec) == latlon_to_proj_string(35.6895, 139.6917)
 
 
-def test_geo_reference_falls_back_to_mgrs_code():
-    spec = OriginSpec(mgrs_code="54SUE")
+def test_geo_reference_prefers_mgrs_code():
+    # lat/lon here is the grid square's corner, which sits on a grid
+    # boundary; the mgrs_code is authoritative.
+    spec = OriginSpec(mgrs_code="54SUE", lat=35.6895, lon=139.6917)
     assert geo_reference_for_origin(spec) == mgrs_to_proj_string("54SUE")
+
+
+def test_geo_reference_folds_origin_spec_offset():
+    spec = OriginSpec(mgrs_code="54SUE", offset_x=81655.73, offset_y=50137.43)
+    assert geo_reference_for_origin(spec) == mgrs_grid_with_offset_to_proj_string(
+        "54SUE", 81655.73, 50137.43
+    )
 
 
 def test_geo_reference_requires_origin():

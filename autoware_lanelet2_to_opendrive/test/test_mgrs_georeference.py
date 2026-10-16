@@ -175,3 +175,12 @@ def test_mgrs_grid_with_offset_to_proj_string_preserves_fractional_offset():
     # would be off by ~0.27 m / 0.43 m, well outside this tolerance.
     assert x == pytest.approx(grid_x - offset_x, abs=1e-6)
     assert y == pytest.approx(grid_y - offset_y, abs=1e-6)
+
+
+def test_full_precision_grid_anchors_at_grid_square_corner():
+    """In-square digits must not move the frame: MGRSProjector emits
+    coordinates relative to the 100 km square's corner, not to that point."""
+    assert mgrs_to_proj_string("54SUE1234567890") == mgrs_to_proj_string("54SUE")
+    assert mgrs_grid_with_offset_to_proj_string(
+        "54SUE1234567890", 81655.73, 50137.43
+    ) == mgrs_grid_with_offset_to_proj_string("54SUE", 81655.73, 50137.43)
