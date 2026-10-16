@@ -16,10 +16,7 @@ jobs:
         include:
           - python-version: "3.10"
             carla-extra: "carla"
-            runner: ubicloud-standard-8-ubuntu-2204
-          - python-version: "3.10"
-            carla-extra: "carla-0-9-16"
-            runner: ubicloud-standard-8-ubuntu-2204
+            runner: ubuntu-22.04
 
     steps:
     - uses: actions/checkout@v4
@@ -38,12 +35,10 @@ jobs:
       run: uv run pytest -v --tb=short -n auto -o addopts=
 
     - name: Check package can be built
-      run: |
-        uv build --package autoware-lanelet2-to-opendrive
-        uv build --package autoware-carla-scenario
+      run: uv build --package autoware-lanelet2-to-opendrive
 
   lint-and-format:
-    runs-on: ubicloud-standard-8-ubuntu-2204
+    runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
 
@@ -55,11 +50,11 @@ jobs:
         run-precommit: "true"
         precommit-continue-on-error: "false"
         carla-extra: "carla"
-        cache-suffix: ubicloud-standard-8-ubuntu-2204
+        cache-suffix: ubuntu-22.04
 
   auto-format:
     name: Auto-fix formatting
-    runs-on: ubicloud-standard-8-ubuntu-2204
+    runs-on: ubuntu-22.04
     needs: lint-and-format
     if: |
       failure() &&
@@ -81,7 +76,7 @@ jobs:
           install-dev-deps: "true"
           run-precommit: "false"
           carla-extra: "carla"
-          cache-suffix: ubicloud-standard-8-ubuntu-2204
+          cache-suffix: ubuntu-22.04
 
       - name: Run pre-commit auto-fix
         run: uv run pre-commit run --all-files || true
@@ -99,7 +94,7 @@ jobs:
           git push
 
   docs:
-    runs-on: ubicloud-standard-8-ubuntu-2204
+    runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
       with:
@@ -112,19 +107,12 @@ jobs:
         install-dev-deps: "true"
         run-precommit: "false"
         carla-extra: "carla"
-        cache-suffix: ubicloud-standard-8-ubuntu-2204
+        cache-suffix: ubuntu-22.04
 
     - name: Build lanelet2-to-opendrive documentation
       uses: ./.github/actions/build-docs
       with:
         package-dir: autoware_lanelet2_to_opendrive
-        config-file: mkdocs.ci.yml
-        strict: "true"
-
-    - name: Build carla-scenario documentation
-      uses: ./.github/actions/build-docs
-      with:
-        package-dir: autoware_carla_scenario
         config-file: mkdocs.ci.yml
         strict: "true"
 
@@ -136,16 +124,8 @@ jobs:
         path: autoware_lanelet2_to_opendrive/site/
         retention-days: 7
 
-    - name: Upload carla-scenario documentation artifact
-      uses: actions/upload-artifact@v4
-      if: success()
-      with:
-        name: documentation-carla-scenario
-        path: autoware_carla_scenario/site/
-        retention-days: 7
-
   check-src-changes:
-    runs-on: ubicloud-standard-8-ubuntu-2204
+    runs-on: ubuntu-22.04
     outputs:
       src-changed: ${{ steps.filter.outputs.src }}
     steps:
@@ -160,7 +140,7 @@ jobs:
   carla-import-test:
     needs: check-src-changes
     if: needs.check-src-changes.outputs.src-changed == 'true'
-    runs-on: ubicloud-standard-8-ubuntu-2204
+    runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
 
@@ -171,7 +151,7 @@ jobs:
         install-dev-deps: "true"
         run-precommit: "false"
         carla-extra: "carla"
-        cache-suffix: ubicloud-standard-8-ubuntu-2204
+        cache-suffix: ubuntu-22.04
 
     - name: Convert Lanelet2 map to OpenDRIVE (CARLA target)
       run: |
@@ -209,7 +189,7 @@ jobs:
         retention-days: 7
 
   qc-validate:
-    runs-on: ubicloud-standard-8-ubuntu-2204
+    runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
     - name: Setup environment
@@ -219,7 +199,7 @@ jobs:
         install-dev-deps: "true"
         run-precommit: "false"
         carla-extra: "carla"
-        cache-suffix: ubicloud-standard-8-ubuntu-2204
+        cache-suffix: ubuntu-22.04
     - name: Convert fixture map
       run: |
         uv run convert \
