@@ -253,6 +253,23 @@ class ArcSpiralConstants:
 
 
 @dataclass(frozen=True)
+class ProjectionConstants:
+    """Constants for resolving the map projection.
+
+    Attributes:
+        transverse_mercator_default_scale_factor: Central-meridian scale
+            factor (k0) used when a TransverseMercator
+            ``map_projector_info.yaml`` omits ``scale_factor``. Matches
+            Autoware's projector, which uses
+            ``GeographicLib::TransverseMercator::UTM()`` (k0 = 0.9996), and
+            the default of the pinned lanelet2 ``TransverseMercatorProjector``
+            binding. Dimensionless.
+    """
+
+    transverse_mercator_default_scale_factor: float = 0.9996
+
+
+@dataclass(frozen=True)
 class GeoMappingConstants:
     """Constants for the geometric lanelet -> (road_id, lane_id) mapping.
 
@@ -323,6 +340,7 @@ class ConversionConstants:
         opendrive: OpenDRIVE format constants
         parampoly3: ParamPoly3 geometry generation constants
         arcspiral: Arc/spiral classifier internal tunables
+        projection: Map projection resolution constants
         geo_mapping: Geometric mapping cross-validation constants
     """
 
@@ -333,6 +351,7 @@ class ConversionConstants:
     opendrive: OpenDriveConstants = OpenDriveConstants()
     parampoly3: ParamPoly3Constants = ParamPoly3Constants()
     arcspiral: ArcSpiralConstants = ArcSpiralConstants()
+    projection: ProjectionConstants = ProjectionConstants()
     geo_mapping: GeoMappingConstants = GeoMappingConstants()
 
 
