@@ -8,7 +8,7 @@ import lxml.etree as ET
 import numpy as np
 from lanelet2.routing import RoutingGraph
 
-from ..config import DEFAULT_CONFIG
+from ..config import DEFAULT_CONFIG, CoordinateOffset
 from ..cubic_spline_1d import CubicSpline1D
 from ..spline import Splines
 
@@ -144,6 +144,7 @@ class ReferenceLine:
         routing_graph: Optional[RoutingGraph] = None,
         start_xyz_override: Optional[Tuple[float, float, float]] = None,
         end_xyz_override: Optional[Tuple[float, float, float]] = None,
+        offset: CoordinateOffset = CoordinateOffset(),
         start_hdg_override: Optional[float] = None,
         end_hdg_override: Optional[float] = None,
     ) -> "ReferenceLine":
@@ -170,6 +171,8 @@ class ReferenceLine:
                 spline fitting.  Used by the junction phase to pin a
                 connecting road's s=length endpoint to the outgoing road's
                 endpoint.
+            offset: Coordinate offset to subtract from extracted boundary
+                points. Defaults to a zero offset.
             start_hdg_override: Optional world-frame tangent angle (radians)
                 that replaces the *direction* of the fitted spline's s=0
                 boundary constraint.  The position override above makes the
@@ -230,7 +233,7 @@ class ReferenceLine:
         # This avoids the 3D-to-2D arc length mapping issues on steep slopes
         from ..util import extract_points_3d
 
-        points_3d = extract_points_3d(boundary)
+        points_3d = extract_points_3d(boundary, offset=offset)
         logger.debug(f"Boundary points count: {len(points_3d)}")
         logger.debug(
             f"First point (original): [{points_3d[0, 0]:.3f}, {points_3d[0, 1]:.3f}, {points_3d[0, 2]:.3f}]"

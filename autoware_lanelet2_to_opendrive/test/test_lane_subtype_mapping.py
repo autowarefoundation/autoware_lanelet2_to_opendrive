@@ -16,7 +16,6 @@ import io
 import lanelet2
 import pytest
 
-from autoware_lanelet2_to_opendrive.config import COORDINATE_OFFSET
 from autoware_lanelet2_to_opendrive.conversion_config import (
     ConversionConfig,
     OriginSpec,
@@ -173,16 +172,14 @@ def _convert_adjacent_subtype_map(adjacent_subtype: str):
         parampoly3=ParamPoly3Config(enabled=False),
     )
 
-    COORDINATE_OFFSET.reset()
-    try:
-        with (
-            contextlib.redirect_stdout(io.StringIO()),
-            contextlib.redirect_stderr(io.StringIO()),
-        ):
-            opendrive, *_ = convert_lanelet2_to_opendrive(lanelet_map, config)
-        return opendrive.to_xml()
-    finally:
-        COORDINATE_OFFSET.reset()
+    # The coordinate offset is threaded via ``config.origin`` (zero by
+    # default), so no global state needs to be reset around the conversion.
+    with (
+        contextlib.redirect_stdout(io.StringIO()),
+        contextlib.redirect_stderr(io.StringIO()),
+    ):
+        opendrive, *_ = convert_lanelet2_to_opendrive(lanelet_map, config)
+    return opendrive.to_xml()
 
 
 def _lane_width_values(lane) -> list[float]:

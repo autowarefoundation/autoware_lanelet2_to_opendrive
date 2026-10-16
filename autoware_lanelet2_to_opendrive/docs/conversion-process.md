@@ -160,9 +160,9 @@ During map loading (`load_lanelet2_map()` in [`main.py`](https://github.com/tier
 
 **B. Coordinate Offset Application**
 
-Global offset system ([`config.py:COORDINATE_OFFSET`](https://github.com/tier4/autoware_lanelet2_to_opendrive/blob/master/autoware_lanelet2_to_opendrive/src/autoware_lanelet2_to_opendrive/config.py)):
-- Set before map loading via `COORDINATE_OFFSET.set(x, y, z)`
-- Applied during OpenDRIVE export when extracting geometry
+Coordinate offset (immutable [`config.py:CoordinateOffset`](https://github.com/tier4/autoware_lanelet2_to_opendrive/blob/master/autoware_lanelet2_to_opendrive/src/autoware_lanelet2_to_opendrive/config.py) value, threaded explicitly):
+- Resolved once (from `map_projector_info.yaml` / Hydra config) into `ConversionConfig.origin.offset_x/y/z`, then carried by the converter as `self.offset` and passed as an explicit parameter through the extraction pipeline
+- Applied during OpenDRIVE export when extracting geometry (no mutable global)
 - **Subtraction operation**: `output_coordinate = lanelet2_coordinate - offset`
 - Makes output coordinates relative to offset point
 - Used when map has large coordinate values that need normalization
@@ -477,7 +477,7 @@ remove_turn_direction_operations:
 1. **Parse Hydra Config**: Load YAML configuration
 2. **Resolve Origin**: Prefer `map_projector_info.yaml`; otherwise fall back
    to the (deprecated) explicit `mgrs_grid`/`lat_lon` config keys
-3. **Set Coordinate Offset**: If offset specified, activate global offset
+3. **Resolve Coordinate Offset**: If offset specified, fold it into `ConversionConfig.origin`, from which the converter threads it explicitly through the extraction pipeline
 4. **Run Preprocessing**: If operations configured, execute preprocessing
 5. **Load Map**: Load preprocessed (or original) Lanelet2 map
 6. **Convert to OpenDRIVE**: Execute conversion pipeline

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Optional, List
 import lxml.etree as ET
 
-from ..config import COORDINATE_OFFSET
+from ..config import CoordinateOffset
 from ..conversion_config import DEFAULT_SIGNAL_COUNTRY
 
 logger = logging.getLogger(__name__)
@@ -276,6 +276,7 @@ class Signal:
         road_elevation_at_s: Optional[float] = None,
         light_linestring: Any = None,
         position_inertial: Optional["PositionInertial"] = None,
+        offset: CoordinateOffset = CoordinateOffset(),
         country: str = DEFAULT_SIGNAL_COUNTRY,
     ) -> "Signal":
         """Construct a Signal from a lanelet2 TrafficLight regulatory element.
@@ -307,6 +308,8 @@ class Signal:
                 does not carry per-bulb attributes.
             position_inertial: Physical position of the signal in inertial
                 coordinates. If provided, attached to the Signal object.
+            offset: Coordinate offset to subtract from the signal's absolute
+                z coordinate. Defaults to a zero offset.
             country: OpenDRIVE signal country code.
 
         Returns:
@@ -346,7 +349,7 @@ class Signal:
         # Calculate z_offset from the centroid z of all points in the linestring
         n = len(light_linestring)
         centroid_z = sum(float(light_linestring[i].z) for i in range(n)) / n
-        signal_absolute_z = centroid_z - COORDINATE_OFFSET.z
+        signal_absolute_z = centroid_z - offset.z
         if road_elevation_at_s is not None:
             z_offset = signal_absolute_z - road_elevation_at_s
         else:

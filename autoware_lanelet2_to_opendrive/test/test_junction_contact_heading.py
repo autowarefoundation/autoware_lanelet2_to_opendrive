@@ -32,6 +32,7 @@ import lanelet2
 import numpy as np
 import pytest
 
+from autoware_lanelet2_to_opendrive.config import CoordinateOffset
 from autoware_lanelet2_to_opendrive.opendrive.reference_line import ReferenceLine
 
 # The ASAM tolerance for lane borders of two connected drivable lanes.
@@ -116,9 +117,16 @@ def _connector_boundary():
     return local @ rotation.T + np.asarray(CONTACT_XY)
 
 
-def _fit(lanelet_map, lanelet, **overrides) -> ReferenceLine:
+# The synthetic fixtures are built directly in the output frame, so the
+# coordinate offset is an explicit zero rather than an omitted default.
+ZERO_OFFSET = CoordinateOffset()
+
+
+def _fit(
+    lanelet_map, lanelet, offset: CoordinateOffset = ZERO_OFFSET, **overrides
+) -> ReferenceLine:
     return ReferenceLine.construct_from_lanelet_groups(
-        lanelet_map, [lanelet], traffic_rule="RHT", **overrides
+        lanelet_map, [lanelet], traffic_rule="RHT", offset=offset, **overrides
     )
 
 
@@ -561,7 +569,12 @@ def test_lane_section_uses_the_planview_reference_line(connector_map):
 
     planview_line = _fit(lanelet_map, connector, **overrides)
     road = Road.construct_from_lanelet_groups(
-        lanelet_map, [connector], road_id=1, traffic_rule="RHT", **overrides
+        lanelet_map,
+        [connector],
+        road_id=1,
+        traffic_rule="RHT",
+        offset=ZERO_OFFSET,
+        **overrides,
     )
     lane_line = road.lanes.lane_sections[0].center_lane
     assert isinstance(lane_line, ReferenceLine)
@@ -611,3 +624,55 @@ def test_heading_override_far_from_the_tangent_is_ignored():
         start_hdg_override=near,
     )
     assert _angle_between(near, _start_heading(pinned)) < ACHIEVED_HEADING_TOLERANCE_RAD
+
+
+def test_heading_pin_composes_with_a_nonzero_coordinate_offset(connector_map):
+    """The heading-pinned planView and centre lane honour an explicit offset.
+
+    Endpoint overrides are stated in the *output* frame, i.e. after the
+    coordinate offset is subtracted.  The road, its planView reference line
+    and the centre lane it hands to ``LaneSection`` must all be fitted in
+    that same frame; a call site that drops ``offset=`` would fit the
+    boundary in the raw frame and miss the pinned contact by the offset.
+    """
+    from autoware_lanelet2_to_opendrive.opendrive.road import Road
+
+    lanelet_map, _, connector = connector_map
+    offset = CoordinateOffset(x=25.0, y=-10.0, z=3.0)
+    contact_out = (CONTACT_XY[0] - offset.x, CONTACT_XY[1] - offset.y, -offset.z)
+    overrides = dict(
+        start_xyz_override=contact_out,
+        start_hdg_override=INCOMING_HEADING_RAD,
+    )
+
+    planview_line = _fit(lanelet_map, connector, offset=offset, **overrides)
+    road = Road.construct_from_lanelet_groups(
+        lanelet_map,
+        [connector],
+        road_id=1,
+        traffic_rule="RHT",
+        offset=offset,
+        **overrides,
+    )
+    lane_line = road.lanes.lane_sections[0].center_lane
+    assert isinstance(lane_line, ReferenceLine)
+
+    for line in (planview_line, lane_line):
+        assert np.allclose(
+            line.centerline_2d.evaluate(0.0)[:2], contact_out[:2], atol=1e-3
+        )
+        assert (
+            _angle_between(INCOMING_HEADING_RAD, _start_heading(line))
+            < ACHIEVED_HEADING_TOLERANCE_RAD
+        )
+
+    # The far end is not pinned, so it lands on the connector's own last
+    # boundary vertex -- shifted by the offset, not left in the raw frame.
+    raw_end = _connector_boundary()[-1]
+    end_xy = lane_line.centerline_2d.evaluate(lane_line.centerline_2d.total_length)
+    assert np.allclose(
+        end_xy[:2], (raw_end[0] - offset.x, raw_end[1] - offset.y), atol=0.05
+    )
+    assert lane_line.centerline_2d.total_length == pytest.approx(
+        planview_line.centerline_2d.total_length, abs=1e-6
+    )
