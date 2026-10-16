@@ -401,6 +401,28 @@ def test_pinned_junction_contacts_agree_on_heading(nishishinjuku_xodr):
     contract guarantees.  Where the position was not pinned there is
     nothing for the heading to be pinned to.
 
+    The heading half has the same kind of precondition.  The heading pin is
+    only applied when the linked heading lies within
+    ``SplineConstants.max_heading_override_rad`` of the connector's own
+    boundary tangent; beyond that ``_guard_heading_override`` drops it by
+    specification (see ``test_heading_override_far_from_the_tangent_is_ignored``)
+    and the connector keeps its own tangent, because bending a short
+    connector through that angle is worse than the border gap.  Such a
+    contact is therefore out of scope here, and it is recognised by the same
+    limit applied to the emitted headings: a kept pin lands within
+    ``ACHIEVED_HEADING_TOLERANCE_RAD`` of the linked heading, so only a
+    declined one can disagree by more than the guard's limit.  Every
+    disagreement between the ASAM tolerance and that limit still fails the
+    test, and that range holds every other contact's unpinned mismatch on
+    nishishinjuku (at most 13.5 deg), so a dropped override is still caught.
+
+    On nishishinjuku exactly one contact is declined: road 300 ends on
+    lanelet 301024, whose end cut is skewed about 41 deg off its boundaries,
+    so its reference line ends on a 139.6 deg tangent, while connector 644
+    (lanelet 301030, 2.6 m long) runs at 99.4 deg.  It appeared when
+    ``conf/map/nishishinjuku.yaml`` stopped merging those lanelets into
+    longer ones; with the merges there is no contact at that cut at all.
+
     Without the heading override this fails on nishishinjuku; the offender
     count depends on the base, so it is deliberately not quoted here.  The
     assertion does not depend on it either, because the scope is set by a
@@ -412,9 +434,13 @@ def test_pinned_junction_contacts_agree_on_heading(nishishinjuku_xodr):
         _distance3,
         _evaluate_lane_inner_edge,
     )
+    from autoware_lanelet2_to_opendrive.config import DEFAULT_CONFIG
     from autoware_lanelet2_to_opendrive.opendrive.geometry import (
         evaluate_road_endpoints,
     )
+
+    # Beyond this the guard declines the heading pin by design.
+    heading_pin_limit = DEFAULT_CONFIG.spline.max_heading_override_rad
 
     root = ET.parse(str(nishishinjuku_xodr)).getroot()
     endpoints = evaluate_road_endpoints(root)
@@ -427,6 +453,7 @@ def test_pinned_junction_contacts_agree_on_heading(nishishinjuku_xodr):
     PINNED_POSITION_M = 0.001
 
     offenders = []
+    declined = []
     checked = 0
     for junction_elem in root.findall("junction"):
         for conn in junction_elem.findall("connection"):
@@ -463,11 +490,16 @@ def test_pinned_junction_contacts_agree_on_heading(nishishinjuku_xodr):
             if _distance3(expected, actual) > PINNED_POSITION_M:
                 continue  # not pinned here; nothing to align the heading to
 
-            checked += 1
             dpsi = _angle_between(
                 _road_heading_at_end(road_by_id[inc_id], at_start=inc_at_start),
                 _road_heading_at_end(cr, at_start=at_start),
             )
+            if dpsi > heading_pin_limit:
+                # The guard declined this heading pin; see the docstring.
+                declined.append((cr_id, inc_id, contact, math.degrees(dpsi)))
+                continue
+
+            checked += 1
             if dpsi > ASAM_IMPLIED_HEADING_TOLERANCE_RAD:
                 offenders.append((cr_id, inc_id, contact, math.degrees(dpsi)))
 
@@ -482,7 +514,9 @@ def test_pinned_junction_contacts_agree_on_heading(nishishinjuku_xodr):
         pytest.fail(
             f"{len(offenders)} of {checked} pinned junction contacts disagree on "
             f"heading by more than {math.degrees(ASAM_IMPLIED_HEADING_TOLERANCE_RAD):.3f} "
-            f"deg.\nWorst 10:\n{sample}"
+            f"deg.\nWorst 10:\n{sample}\n"
+            f"({len(declined)} contact(s) beyond the "
+            f"{math.degrees(heading_pin_limit):.1f} deg guard limit not counted)"
         )
 
 
