@@ -310,3 +310,106 @@ def test_knot_span_max_length_subdivides_without_losing_exactness(monkeypatch):
             wx, wy = _sample_world(geom, p)
             ref = spline.evaluate(spline.find_closest_s(np.array([wx, wy])))
             assert float(np.hypot(ref[0] - wx, ref[1] - wy)) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# CARLA minimum piece length, continuity after merging, ignored options
+# ---------------------------------------------------------------------------
+
+
+def _dense_hairpin_spline() -> Splines:
+    """A short hairpin with many control points: knot spans well under 0.5 m."""
+    theta = np.linspace(0.0, np.pi, 80)
+    radius = 2.5
+    points = np.column_stack(
+        [radius * np.cos(theta), radius * np.sin(theta), np.zeros(len(theta))]
+    )
+    return Splines(points, num_control_points=40)
+
+
+def _window_hugging_knots(spline: Splines) -> tuple:
+    """A run window that starts 1 mm before one knot and ends 1 mm after another.
+
+    This is what the line/arc classifier produces when a run boundary lands
+    just short of a breakpoint.
+    """
+    breaks = spline.breakpoints()
+    s_lo = spline.arc_length_at_param(breaks[3]) - 1e-3
+    s_hi = spline.arc_length_at_param(breaks[-4]) + 1e-3
+    return s_lo, s_hi
+
+
+def _knot_aligned_cases():
+    winding = _winding_spline()
+    s_lo, s_hi = _window_hugging_knots(winding)
+    dense = _dense_hairpin_spline()
+    return [
+        pytest.param(winding, s_lo, s_hi, id="run-boundary-next-to-knot"),
+        pytest.param(dense, 0.0, dense.total_length, id="tight-curve-short-spans"),
+    ]
+
+
+@pytest.mark.parametrize("spline,s_lo,s_hi", _knot_aligned_cases())
+def test_every_piece_meets_the_minimum_segment_length(spline, s_lo, s_hi):
+    """No emitted piece is shorter than ``min_segment_length`` (CARLA crash)."""
+    config = ParamPoly3Config()
+    segments = ParamPoly3.from_spline_windows(spline, s_lo, s_hi, config)
+
+    assert segments
+    assert min(g.length for g in segments) >= config.min_segment_length
+    for geom in segments:
+        assert _asam_length_error(geom) < ASAM_LENGTH_TOLERANCE
+
+
+@pytest.mark.parametrize("spline,s_lo,s_hi", _knot_aligned_cases())
+def test_merged_pieces_stay_continuous(spline, s_lo, s_hi):
+    """After merging short pieces, s and positions are still continuous."""
+    segments = ParamPoly3.from_spline_windows(spline, s_lo, s_hi, ParamPoly3Config())
+
+    assert segments[0].s == pytest.approx(s_lo, abs=1e-12)
+    for before, after in zip(segments, segments[1:]):
+        assert after.s == pytest.approx(before.s + before.length, abs=1e-12)
+        end_xy = _sample_world(before, end_param(before))
+        assert end_xy == pytest.approx((after.x, after.y), abs=1e-6)
+
+    start = spline.evaluate_param(spline.param_at_arc_length(s_lo))
+    end = spline.evaluate_param(spline.param_at_arc_length(s_hi))
+    assert (segments[0].x, segments[0].y) == pytest.approx(
+        (start[0], start[1]), abs=1e-6
+    )
+    last = segments[-1]
+    assert _sample_world(last, end_param(last)) == pytest.approx(
+        (end[0], end[1]), abs=1e-6
+    )
+
+
+def test_window_shorter_than_minimum_still_emits_one_piece():
+    """A run shorter than the minimum cannot be merged away; keep one piece."""
+    spline = _winding_spline()
+    segments = ParamPoly3.from_spline_windows(spline, 10.0, 10.2, ParamPoly3Config())
+
+    assert len(segments) == 1
+    assert segments[0].length == pytest.approx(0.2, abs=1e-3)
+
+
+def test_ignored_options_warn_once(monkeypatch, caplog):
+    """Uniform-grid options have no effect on the knot-aligned path: say so."""
+    from autoware_lanelet2_to_opendrive.opendrive import geometry as geometry_module
+
+    monkeypatch.setattr(geometry_module, "_warned_ignored_parampoly3_options", False)
+    spline = _winding_spline()
+
+    with caplog.at_level("WARNING", logger=geometry_module.__name__):
+        ParamPoly3.from_spline(spline, config=ParamPoly3Config())
+    assert not caplog.records
+
+    custom = ParamPoly3Config(default_segment_length=3.0, max_segments=50)
+    with caplog.at_level("WARNING", logger=geometry_module.__name__):
+        ParamPoly3.from_spline(spline, config=custom)
+        ParamPoly3.from_spline(spline, config=custom)
+    messages = [r.getMessage() for r in caplog.records]
+    assert len(messages) == 1
+    assert "default_segment_length" in messages[0]
+    assert "max_segments" in messages[0]
+    assert "enabled" not in messages[0]
+    assert "no effect" in messages[0]

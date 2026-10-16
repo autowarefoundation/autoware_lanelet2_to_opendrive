@@ -1,5 +1,7 @@
 """OpenDRIVE geometry definitions."""
 
+import logging
+import warnings
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
@@ -13,6 +15,11 @@ if TYPE_CHECKING:
     from ..spline import Splines
     from ..conversion_config import ParamPoly3Config
 
+
+logger = logging.getLogger(__name__)
+
+#: Set once the "uniform-grid options have no effect" warning has been logged.
+_warned_ignored_parampoly3_options = False
 
 #: ``paramPoly3@pRange`` values defined by ASAM OpenDRIVE.
 PARAM_RANGE_ARC_LENGTH = "arcLength"
@@ -774,6 +781,103 @@ class ParamPoly3(GeometryBase):
         )
 
     @classmethod
+    def hermite_from_spline_params(
+        cls,
+        spline: "Splines",
+        t_start: float,
+        t_end: float,
+        s_start: float,
+        coefficient_epsilon: Optional[float] = None,
+    ) -> "ParamPoly3":
+        """Cubic Hermite ParamPoly3 over ``[t_start, t_end]`` spanning knots.
+
+        Used for a piece that had to be merged across a breakpoint to respect
+        ``min_segment_length``: there the spline is no longer one cubic, so
+        :meth:`exact_from_spline_span` does not apply.  The piece interpolates
+        the spline's position and ``t``-tangent at both ends in the normalized
+        parameter ``p = (t - t_start) / (t_end - t_start)``, so the endpoints
+        (and headings) stay exact and ``pRange``/``@length`` stay consistent
+        with the exact pieces around it.
+        """
+        from ..config import DEFAULT_CONFIG
+
+        if coefficient_epsilon is None:
+            coefficient_epsilon = DEFAULT_CONFIG.parampoly3.coefficient_epsilon
+
+        dt = float(t_end) - float(t_start)
+        origin = spline.evaluate_param(t_start, derivative=0)
+        end = spline.evaluate_param(t_end, derivative=0)
+        tan0 = spline.evaluate_param(t_start, derivative=1) * dt
+        tan1 = spline.evaluate_param(t_end, derivative=1) * dt
+
+        if float(np.hypot(tan0[0], tan0[1])) <= DEFAULT_CONFIG.geometry.epsilon:
+            hdg = float(np.arctan2(end[1] - origin[1], end[0] - origin[0]))
+        else:
+            hdg = float(np.arctan2(tan0[1], tan0[0]))
+        cos_hdg, sin_hdg = np.cos(hdg), np.sin(hdg)
+
+        def to_local(gx: float, gy: float) -> Tuple[float, float]:
+            return (gx * cos_hdg + gy * sin_hdg, -gx * sin_hdg + gy * cos_hdg)
+
+        u1, v1 = to_local(float(end[0] - origin[0]), float(end[1] - origin[1]))
+        du0, dv0 = to_local(float(tan0[0]), float(tan0[1]))
+        du1, dv1 = to_local(float(tan1[0]), float(tan1[1]))
+
+        aU, bU, cU, dU, aV, bV, cV, dV = cls._normalize_coefficients(
+            0.0,
+            du0,
+            3.0 * u1 - 2.0 * du0 - du1,
+            -2.0 * u1 + du0 + du1,
+            0.0,
+            dv0,
+            3.0 * v1 - 2.0 * dv0 - dv1,
+            -2.0 * v1 + dv0 + dv1,
+            epsilon=coefficient_epsilon,
+        )
+        length = param_poly3_arc_length((aU, bU, cU, dU, aV, bV, cV, dV), 1.0)
+
+        return cls(
+            s=float(s_start),
+            x=float(origin[0]),
+            y=float(origin[1]),
+            hdg=hdg,
+            length=length,
+            aU=aU,
+            bU=bU,
+            cU=cU,
+            dU=dU,
+            aV=aV,
+            bV=bV,
+            cV=cV,
+            dV=dV,
+            pRange=PARAM_RANGE_NORMALIZED,
+        )
+
+    @staticmethod
+    def _warn_ignored_options(config: "ParamPoly3Config") -> None:
+        """Log once that uniform-grid options do not affect knot-aligned output."""
+        global _warned_ignored_parampoly3_options
+        if _warned_ignored_parampoly3_options:
+            return
+        from ..conversion_config import ParamPoly3Config
+
+        defaults = ParamPoly3Config()
+        ignored = [
+            name
+            for name in ("default_segment_length", "max_segments", "enabled")
+            if getattr(config, name) != getattr(defaults, name)
+        ]
+        if not ignored:
+            return
+        _warned_ignored_parampoly3_options = True
+        logger.warning(
+            "parampoly3 option(s) %s have no effect with knot-aligned emission "
+            "(pieces follow the spline's knot spans; only min_segment_length "
+            "and coefficient_epsilon apply)",
+            ", ".join(ignored),
+        )
+
+    @classmethod
     def from_spline_windows(
         cls,
         spline: "Splines",
@@ -788,7 +892,11 @@ class ParamPoly3(GeometryBase):
         stays inside one knot span and reproduces the fitted curve exactly
         (:meth:`exact_from_spline_span`).  ``knot_span_max_length`` optionally
         subdivides a long span further -- still inside the span, so still
-        exact.
+        exact.  A cut that would leave a piece shorter than
+        ``config.min_segment_length`` is dropped; the merged piece then spans a
+        breakpoint and is emitted by :meth:`hermite_from_spline_params`
+        (exact endpoints, continuous ``s``).  A window that is itself shorter
+        than the minimum is emitted as a single piece.
 
         With ``knot_aligned`` disabled the legacy uniform Hermite split is used
         instead (kept for A/B comparison and for the regression tests that pin
@@ -798,6 +906,8 @@ class ParamPoly3(GeometryBase):
 
         if not DEFAULT_CONFIG.parampoly3.knot_aligned:
             return cls._legacy_uniform_windows(spline, s_start, s_end, config)
+
+        cls._warn_ignored_options(config)
 
         t_start = spline.param_at_arc_length(s_start)
         t_end = spline.param_at_arc_length(s_end)
@@ -820,27 +930,64 @@ class ParamPoly3(GeometryBase):
                 refined.append(b)
             cuts = refined
 
+        # Drop cuts that would leave a piece below the CARLA minimum.  Keeping
+        # a cut requires both the piece it closes and the remainder of the
+        # window to be long enough, so the last piece is never short either.
+        min_len = config.min_segment_length
+        s_at = [spline.arc_length_at_param(t) for t in cuts]
+        kept = [0]
+        for i in range(1, len(cuts) - 1):
+            if s_at[i] - s_at[kept[-1]] >= min_len and s_at[-1] - s_at[i] >= min_len:
+                kept.append(i)
+        kept.append(len(cuts) - 1)
+        knots = [float(t) for t in breaks]
+
+        # A window shorter than the minimum is still one piece; only the
+        # finiteness / heading checks apply to it.
+        validate_min = min_len if s_at[-1] - s_at[0] >= min_len else 0.0
         segments: List["ParamPoly3"] = []
         s_cursor = float(s_start)
-        for a, b in zip(cuts, cuts[1:]):
-            if b <= a:
-                continue
-            segment = cls.exact_from_spline_span(
+        for i, j in zip(kept, kept[1:]):
+            a, b = cuts[i], cuts[j]
+            single_span = not any(a < t < b for t in knots)
+            build = (
+                cls.exact_from_spline_span
+                if single_span
+                else cls.hermite_from_spline_params
+            )
+            segment = build(
                 spline,
                 t_start=a,
                 t_end=b,
                 s_start=s_cursor,
                 coefficient_epsilon=config.coefficient_epsilon,
             )
-            is_valid, error_msg = cls._validate_segment(segment, min_segment_length=0.0)
+            is_valid, error_msg = cls._validate_segment(
+                segment, min_segment_length=validate_min
+            )
             if not is_valid:
-                import warnings
-
+                # Never drop a piece: that would leave a gap in position while
+                # s carried on.  Fall back to the arc-length Hermite window.
                 warnings.warn(
-                    f"Skipping invalid segment at s={s_cursor:.3f}: {error_msg}",
+                    f"Knot-aligned segment at s={s_cursor:.3f} rejected "
+                    f"({error_msg}); using the legacy window fit",
                     UserWarning,
                 )
-                continue
+                segment = cls.from_spline_window(
+                    spline,
+                    s_at[i],
+                    s_at[j],
+                    coefficient_epsilon=config.coefficient_epsilon,
+                )
+                segment.s = s_cursor
+                is_valid, error_msg = cls._validate_segment(
+                    segment, min_segment_length=validate_min
+                )
+                if not is_valid:
+                    raise ValueError(
+                        f"Cannot emit a valid paramPoly3 at s={s_cursor:.3f}: "
+                        f"{error_msg}"
+                    )
             segments.append(segment)
             s_cursor += segment.length
         return segments
@@ -854,8 +1001,6 @@ class ParamPoly3(GeometryBase):
         config: "ParamPoly3Config",
     ) -> List["ParamPoly3"]:
         """Uniform-grid cubic-Hermite split (pre-knot-alignment behaviour)."""
-        import warnings
-
         length = float(s_end - s_start)
         target = config.default_segment_length if config.enabled else length
         n = max(1, int(np.ceil(length / max(target, config.min_segment_length))))
@@ -1031,8 +1176,6 @@ class ParamPoly3(GeometryBase):
 
         # Divide the spline into segments
         segment_length = total_length / num_segments
-
-        import warnings
 
         for i in range(num_segments):
             # Arc length bounds for this segment
