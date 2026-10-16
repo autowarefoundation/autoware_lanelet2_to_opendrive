@@ -140,8 +140,8 @@ class _Lanelet2ToOpenDRIVEConverter:
             lanelet_map: Loaded Lanelet2 map
             config: ConversionConfig object containing all conversion parameters.
                 The geoReference PROJ string is derived from ``config.origin``:
-                lat/lon are used when available (e.g. when an MGRS offset is
-                applied), otherwise ``config.origin.mgrs_code`` is used.
+                ``mgrs_code`` (with the origin offset folded in) when set,
+                otherwise lat/lon.
         """
         self.lanelet_map = lanelet_map
         self.config = config
