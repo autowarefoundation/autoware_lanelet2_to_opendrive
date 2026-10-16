@@ -114,12 +114,21 @@ configuration before running.
 
 The preferred way to specify the map origin is a `map_projector_info.yaml`
 file placed next to the input `.osm` map (same directory). When present with
-a supported `projector_type` (currently `MGRS`), it is used as the origin
-source and any `mgrs_grid`/`lat_lon` keys in the map config are ignored:
+a supported `projector_type` (`MGRS` or `TransverseMercator`, matched
+case-sensitively as Autoware writes them), it is used as the origin source and
+any `mgrs_grid`/`lat_lon` keys in the map config are ignored:
 
 ```yaml
 projector_type: MGRS
 mgrs_grid: 54SUE
+```
+
+```yaml
+projector_type: TransverseMercator
+map_origin:
+  latitude: 35.61739731
+  longitude: 139.7797546
+scale_factor: 0.9996  # optional; defaults to the UTM k0 (0.9996)
 ```
 
 This is the format Autoware itself writes alongside a map, so pointing the

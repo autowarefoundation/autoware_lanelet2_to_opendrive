@@ -10,7 +10,7 @@ layouts are::
 
     projector_type: TransverseMercator      # or LocalCartesianUTM
     vertical_datum: WGS84
-    scale_factor: 0.9996                    # TransverseMercator only
+    scale_factor: 0.9996                    # optional, TransverseMercator only
     map_origin:
       latitude: 35.6762
       longitude: 139.6503
@@ -22,7 +22,9 @@ layouts are::
 the *shape* of each field (type, presence of ``latitude``/``longitude`` under
 ``map_origin``) and raises :class:`ValueError` naming the offending file and
 key. Which fields a given ``projector_type`` *requires* is a projector
-concern and is checked by the caller that builds the projector.
+concern and is checked by the caller that builds the projector. For
+TransverseMercator, ``scale_factor`` is optional and defaults to ``0.9996``
+(Autoware's ``GeographicLib::TransverseMercator::UTM()`` k0) when absent.
 
 This module depends only on PyYAML so callers that must stay light can use
 it without importing ``lanelet2``.

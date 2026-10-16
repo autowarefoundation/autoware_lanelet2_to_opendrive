@@ -4,12 +4,14 @@ Resolves the map's coordinate frame in one place: origin parsing (from a Hydra
 config or an :class:`OriginSpec`), projector construction, geoReference
 PROJ-string generation, and the coordinate offset applied during export.
 
-Behavior-preserving extraction of logic that previously lived inline in
-``main.py`` (issue #540): the resolved values are identical to before, so the
-emitted ``.xodr`` is byte-identical.
+The MGRS / explicit-key paths are a behavior-preserving extraction of logic
+that previously lived inline in ``main.py`` (issue #540): their outputs remain
+byte-identical. TransverseMercator support and the soft deprecation of the
+explicit origin keys were added on top.
 """
 
 import logging
+import math
 import re
 import warnings
 from dataclasses import dataclass
@@ -18,14 +20,19 @@ from typing import Optional, Tuple
 
 import lanelet2
 import mgrs as mgrs_lib
-from autoware_lanelet2_extension_python.projection import MGRSProjector
+from autoware_lanelet2_extension_python.projection import (
+    MGRSProjector,
+    TransverseMercatorProjector,
+)
 from omegaconf import DictConfig
 
+from .config import DEFAULT_CONFIG
 from .conversion_config import OriginSpec
 from .map_projector_info import MAP_PROJECTOR_INFO_FILENAME, MapProjectorInfo
 from .projection import (
     latlon_to_lanelet2_origin,
     latlon_to_proj_string,
+    latlon_to_tmerc_proj_string,
     mgrs_grid_with_offset_to_lanelet2_origin,
     mgrs_grid_with_offset_to_latlon,
     mgrs_to_lanelet2_origin,
@@ -33,6 +40,11 @@ from .projection import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: ``projector_type`` values are matched case-sensitively, exactly as
+#: Autoware's ``map_projection_loader`` writes and compares them.
+_MGRS = "MGRS"
+_TRANSVERSE_MERCATOR = "TransverseMercator"
 
 # Once-per-process guard for the legacy-origin-key logger.warning (the
 # DeprecationWarning is already de-duplicated per call site by the warnings
@@ -96,6 +108,11 @@ class ResolvedProjection:
 
     ``mgrs_code`` and ``origin_lat``/``origin_lon`` may be ``None`` depending on
     how the origin was specified; the offset defaults to zero.
+
+    ``projector_type`` selects the projector :meth:`make_projector` builds and
+    how :attr:`geo_reference` is derived; it defaults to ``"MGRS"`` so
+    existing call sites keep their prior behavior. ``scale_factor`` only
+    applies when ``projector_type == "TransverseMercator"``.
     """
 
     origin: lanelet2.io.Origin
@@ -105,8 +122,12 @@ class ResolvedProjection:
     offset_x: float = 0.0
     offset_y: float = 0.0
     offset_z: float = 0.0
+    scale_factor: Optional[float] = None
+    projector_type: str = "MGRS"
 
-    def make_projector(self) -> MGRSProjector:
+    def make_projector(self) -> "MGRSProjector | TransverseMercatorProjector":
+        if self.projector_type == _TRANSVERSE_MERCATOR:
+            return TransverseMercatorProjector(self.origin, self.scale_factor)
         return MGRSProjector(self.origin)
 
     @property
@@ -126,6 +147,10 @@ class ResolvedProjection:
 
     @property
     def geo_reference(self) -> str:
+        if self.projector_type == _TRANSVERSE_MERCATOR:
+            return latlon_to_tmerc_proj_string(
+                self.origin_lat, self.origin_lon, self.scale_factor
+            )
         return geo_reference_for_origin(self.to_origin_spec())
 
 
@@ -274,29 +299,88 @@ def _resolve_from_explicit_keys(cfg: DictConfig) -> ResolvedProjection:
     )
 
 
+def _resolve_transverse_mercator(
+    info_path: Path, info: MapProjectorInfo
+) -> ResolvedProjection:
+    """Build a :class:`ResolvedProjection` for ``projector_type: TransverseMercator``.
+
+    ``scale_factor`` is optional. When absent it defaults to
+    ``DEFAULT_CONFIG.projection.transverse_mercator_default_scale_factor``
+    (0.9996): real Autoware TransverseMercator yamls usually omit it, and
+    Autoware's projector uses ``GeographicLib::TransverseMercator::UTM()``
+    (k0 = 0.9996). Any positive, finite ``scale_factor`` is accepted and
+    threaded straight through to the ``TransverseMercatorProjector`` binding.
+
+    Args:
+        info_path: Path to the ``map_projector_info.yaml`` file (for error
+            messages).
+        info: Typed contents of the file.
+
+    Returns:
+        A :class:`ResolvedProjection` with ``projector_type="TransverseMercator"``.
+
+    Raises:
+        ValueError: If ``map_origin`` is missing, or if a present
+            ``scale_factor`` is not a positive, finite number.
+    """
+    if info.map_origin is None:
+        raise ValueError(
+            f"{info_path}: projector_type 'TransverseMercator' requires "
+            "'map_origin.latitude' and 'map_origin.longitude' fields"
+        )
+    origin_lat = info.map_origin.latitude
+    origin_lon = info.map_origin.longitude
+
+    scale_factor = (
+        DEFAULT_CONFIG.projection.transverse_mercator_default_scale_factor
+        if info.scale_factor is None
+        else info.scale_factor
+    )
+    if not (math.isfinite(scale_factor) and scale_factor > 0):
+        raise ValueError(
+            f"{info_path}: TransverseMercator scale_factor={scale_factor!r} must be "
+            "a positive, finite number"
+        )
+
+    origin = lanelet2.io.Origin(origin_lat, origin_lon)
+    return ResolvedProjection(
+        origin=origin,
+        mgrs_code=None,
+        origin_lat=origin_lat,
+        origin_lon=origin_lon,
+        scale_factor=scale_factor,
+        projector_type=_TRANSVERSE_MERCATOR,
+    )
+
+
 def _resolve_from_map_projector_info(
     info: MapProjectorInfo, info_path: Path
 ) -> Optional[ResolvedProjection]:
     """Build a :class:`ResolvedProjection` from a ``map_projector_info.yaml``.
 
-    Only ``projector_type: MGRS`` is supported here; it reproduces the exact
-    projector/geoReference of the equivalent explicit ``mgrs_grid`` config,
-    so existing MGRS outputs stay byte-identical. Other projector types
-    return ``None`` so the caller falls back to the explicit origin keys.
+    ``projector_type: MGRS`` and ``projector_type: TransverseMercator`` are
+    wired. For an MGRS grid this reproduces the exact projector/geoReference
+    of the equivalent explicit ``mgrs_grid`` config, so existing MGRS
+    outputs stay byte-identical. Other projector types return ``None`` so
+    the caller falls back to the explicit origin keys.
 
     Args:
         info: The parsed ``map_projector_info.yaml``.
         info_path: Path to the file (used in error messages).
 
     Returns:
-        A :class:`ResolvedProjection` for MGRS, or ``None`` for unsupported
-        projector types.
+        A :class:`ResolvedProjection` for MGRS or TransverseMercator, or
+        ``None`` for unsupported projector types.
 
     Raises:
         ValueError: If ``projector_type`` is MGRS but ``mgrs_grid`` is
-            missing.
+            missing, or if ``projector_type`` is
+            TransverseMercator but ``map_origin`` is missing or
+            ``scale_factor`` is invalid (see
+            :func:`_resolve_transverse_mercator`). ``projector_type`` is
+            matched case-sensitively, as Autoware writes it.
     """
-    if info.projector_type.upper() == "MGRS":
+    if info.projector_type == _MGRS:
         if info.mgrs_grid is None:
             raise ValueError(
                 f"{info_path}: projector_type 'MGRS' requires a 'mgrs_grid' field"
@@ -311,6 +395,10 @@ def _resolve_from_map_projector_info(
             origin_lat=origin_lat,
             origin_lon=origin_lon,
         )
+
+    if info.projector_type == _TRANSVERSE_MERCATOR:
+        return _resolve_transverse_mercator(info_path, info)
+
     return None
 
 
