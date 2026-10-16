@@ -18,6 +18,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libgl1 \
       git ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
+# Avoid "dubious ownership" errors from git on the host-owned bind-mounted
+# .git (see docs/docker.md#running-from-a-git-worktree).
+RUN git config --system --add safe.directory '*'
 COPY --from=ghcr.io/astral-sh/uv:0.9.7 /uv /uvx /usr/local/bin/
 WORKDIR /workspace
 
@@ -34,8 +37,6 @@ WORKDIR /workspace
 FROM base AS deps
 COPY pyproject.toml uv.lock .python-version ./
 COPY autoware_lanelet2_to_opendrive/ autoware_lanelet2_to_opendrive/
-COPY autoware_carla_scenario/ autoware_carla_scenario/
-COPY carla_wheels/ carla_wheels/
 RUN uv sync --frozen --dev --extra carla
 
 FROM deps AS dev

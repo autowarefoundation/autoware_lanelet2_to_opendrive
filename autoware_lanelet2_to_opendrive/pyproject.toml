@@ -1,6 +1,6 @@
 [project]
 name = "autoware-lanelet2-to-opendrive"
-version = "2.61.5"
+version = "2.62.0"
 description = "Convert Lanelet2 map format to OpenDRIVE format for Autoware"
 readme = "README.md"
 authors = [
@@ -28,6 +28,13 @@ dependencies = [
     # latlon_to_tmerc_proj_string(); not used by production conversion code.
     "pyproj>=3.6",
 ]
+
+[project.optional-dependencies]
+# Only `carla-import-test` imports the CARLA client. typesafe-carla ships the
+# CARLA 0.10.0 (UE5) PythonAPI as a prebuilt extension module,
+# `typesafe_carla.carla`, from PyPI -- the official 0.10.0 client is not
+# published there and would have to be vendored.
+carla = ["typesafe-carla>=0.3.0"]
 
 [build-system]
 requires = ["uv_build>=0.9.7,<0.10.0"]
