@@ -408,25 +408,30 @@ def test_pinned_junction_contacts_agree_on_heading(nishishinjuku_xodr):
     specification (see ``test_heading_override_far_from_the_tangent_is_ignored``)
     and the connector keeps its own tangent, because bending a short
     connector through that angle is worse than the border gap.  Such a
-    contact is therefore out of scope here, and it is recognised by the same
-    limit applied to the emitted headings: a kept pin lands within
-    ``ACHIEVED_HEADING_TOLERANCE_RAD`` of the linked heading, so only a
-    declined one can disagree by more than the guard's limit.  Every
-    disagreement between the ASAM tolerance and that limit still fails the
-    test, and that range holds every other contact's unpinned mismatch on
-    nishishinjuku (at most 13.5 deg), so a dropped override is still caught.
+    contact is therefore out of scope here.  It is approximated by applying
+    the same limit to the emitted headings (the guard itself compares against
+    the connector's pre-fit tangent, so this is a proxy, not the guard's own
+    test).  Every disagreement between the ASAM tolerance and that limit
+    still fails the test, and that range holds every other contact's
+    unpinned mismatch on nishishinjuku (at most 13.5 deg), so a dropped
+    override is still caught.  The set of declined contacts is asserted
+    exactly (``EXPECTED_DECLINED``), so a new decline -- from a map change, a
+    smaller guard limit or a fit that misses -- fails loudly instead of being
+    skipped.
 
     On nishishinjuku exactly one contact is declined: road 300 ends on
     lanelet 301024, whose end cut is skewed about 41 deg off its boundaries,
     so its reference line ends on a 139.6 deg tangent, while connector 644
     (lanelet 301030, 2.6 m long) runs at 99.4 deg.  It appeared when
     ``conf/map/nishishinjuku.yaml`` stopped merging those lanelets into
-    longer ones; with the merges there is no contact at that cut at all.
+    longer ones.  The 40 deg break there is a known defect outside this
+    test's scope: ``_calculate_centerline_velocity_vector`` takes a lanelet's
+    end tangent perpendicular to its end cut, which assumes a square cut.
 
     Without the heading override this fails on nishishinjuku; the offender
     count depends on the base, so it is deliberately not quoted here.  The
-    assertion does not depend on it either, because the scope is set by a
-    measured precondition rather than by a fixed list of roads.
+    agreement assertion does not depend on it either, because its scope is
+    set by measured preconditions; only the declined set is a fixed list.
     """
     import lxml.etree as ET
 
@@ -504,6 +509,19 @@ def test_pinned_junction_contacts_agree_on_heading(nishishinjuku_xodr):
                 offenders.append((cr_id, inc_id, contact, math.degrees(dpsi)))
 
     assert checked > 0, "no pinned junction contacts found; the scope is wrong"
+
+    # (connecting road, incoming road, contactPoint) of every contact whose
+    # heading pin the guard is expected to decline; see the docstring.
+    EXPECTED_DECLINED = {(644, 300, "start")}
+    declined_keys = {(c, i, p) for c, i, p, _ in declined}
+    assert declined_keys == EXPECTED_DECLINED, (
+        "the set of contacts beyond the "
+        f"{math.degrees(heading_pin_limit):.1f} deg guard limit changed: "
+        + ", ".join(
+            f"conn_road={c} incoming={i} contact={p} dpsi={d:.2f} deg"
+            for c, i, p, d in sorted(declined)
+        )
+    )
 
     if offenders:
         offenders.sort(key=lambda o: -o[3])
