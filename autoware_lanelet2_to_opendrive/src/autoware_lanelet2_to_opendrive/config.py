@@ -69,10 +69,9 @@ class SplineConstants:
             boundary therefore yields an under-parameterised fit that is
             unconstrained between vertices and can bow metres away from the
             polyline it is meant to reproduce. Subdividing every segment
-            longer than this value before fitting bounds that error; 0.5 m is
-            an order of magnitude below a lane width, so the inserted points
-            pin the curve to the polyline without adding meaningful shape of
-            their own. Only ever adds points, so densely digitised boundaries
+            longer than this value before fitting bounds that error; 1.0 m is
+            well below a lane width, so the inserted points pin the curve to
+            the polyline without adding meaningful shape of their own. Only ever adds points, so densely digitised boundaries
             are unaffected.
     """
 
