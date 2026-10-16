@@ -6,8 +6,12 @@ coordinate offset are all resolved from one place, with no change to the
 previously emitted values.
 """
 
+import logging
+
 import pytest
 from omegaconf import OmegaConf
+
+import autoware_lanelet2_to_opendrive.projection_resolver as projection_resolver
 
 from autoware_lanelet2_to_opendrive.conversion_config import OriginSpec
 from autoware_lanelet2_to_opendrive.projection import (
@@ -21,6 +25,15 @@ from autoware_lanelet2_to_opendrive.projection_resolver import (
     resolve_projection,
     resolve_projection_from_hydra,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_legacy_origin_log_guard(monkeypatch):
+    """The legacy-key logger.warning fires once per process; reset that guard
+    so each test observes it independently of test order."""
+    monkeypatch.setattr(
+        projection_resolver, "_legacy_origin_keys_logged", False, raising=False
+    )
 
 
 def _cfg(map_dict):
@@ -245,19 +258,58 @@ def test_map_projector_info_wins_over_explicit_keys(tmp_path, recwarn):
     assert not any(issubclass(w.category, DeprecationWarning) for w in recwarn.list)
 
 
-def test_resolve_projection_non_mgrs_type_falls_back(tmp_path):
-    """A not-yet-supported projector type falls back to explicit keys
-    (legacy, so a DeprecationWarning is expected)."""
+@pytest.mark.parametrize("projector_type", ["LocalCartesianUTM", "LocalCartesian"])
+def test_resolve_projection_unsupported_type_falls_back_without_deprecation(
+    tmp_path, recwarn, caplog, projector_type
+):
+    """A recognised-but-unsupported projector type falls back to the explicit
+    keys, but must NOT tell the user to "provide a map_projector_info.yaml"
+    (they already did, and have no non-deprecated way to resolve the origin).
+    """
     osm = _write_map(
         tmp_path,
         projector_info=(
-            "projector_type: TransverseMercator\n"
+            f"projector_type: {projector_type}\n"
             "map_origin:\n  latitude: 35.0\n  longitude: 139.0\n"
         ),
     )
-    with pytest.warns(DeprecationWarning, match="map_projector_info.yaml"):
+    with caplog.at_level(logging.WARNING, logger=projection_resolver.__name__):
         resolved = resolve_projection(_cfg({"mgrs_grid": "54SUE"}), osm)
     assert resolved.mgrs_code == "54SUE"
+
+    assert not any(issubclass(w.category, DeprecationWarning) for w in recwarn.list)
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("deprecated" in m for m in messages), messages
+    assert not any("Prefer map_projector_info.yaml" in m for m in messages), messages
+    assert any(
+        projector_type in m
+        and "not supported yet" in m
+        and "remain required for this map" in m
+        for m in messages
+    ), messages
+
+
+def test_resolve_projection_without_info_emits_deprecation(tmp_path, caplog):
+    """With no projector-info file the normal deprecation is still emitted,
+    both as a DeprecationWarning and as a logger warning."""
+    osm = _write_map(tmp_path)
+    with caplog.at_level(logging.WARNING, logger=projection_resolver.__name__):
+        with pytest.warns(DeprecationWarning, match="map_projector_info.yaml"):
+            resolve_projection(_cfg({"mgrs_grid": "54SUE"}), osm)
+    assert any(
+        "deprecated" in r.getMessage() and "map_projector_info.yaml" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_legacy_origin_log_warning_fires_once(caplog):
+    """The deprecation logger.warning is emitted once per process."""
+    with caplog.at_level(logging.WARNING, logger=projection_resolver.__name__):
+        with pytest.warns(DeprecationWarning):
+            resolve_projection_from_hydra(_cfg({"mgrs_grid": "54SUE"}))
+            resolve_projection_from_hydra(_cfg({"mgrs_grid": "54SUE"}))
+    deprecations = [r for r in caplog.records if "deprecated" in r.getMessage()]
+    assert len(deprecations) == 1
 
 
 def test_map_projector_info_mgrs_without_grid_raises(tmp_path):
