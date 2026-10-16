@@ -64,6 +64,14 @@ services:
     command: pytest -v --tb=short -n auto
     profiles: ["test"]
 
+  # Resident container for scripts/tdd.py: each red/green run is a
+  # `docker compose exec` into it instead of a fresh container start.
+  tdd:
+    <<: *carla-base
+    command: sleep infinity
+    init: true
+    profiles: ["tdd"]
+
   pytest-native:
     <<: *native-base
     # No test module imports the CARLA client (only the `carla-import-test`
