@@ -219,7 +219,9 @@ def _drop_mutual_conflicts(
                 sources[jid][rev],
             )
         prio_set -= mutual
-        dropped_total += len(mutual)
+        # ``seen`` holds one entry per conflicting road pair; ``mutual`` holds
+        # both directions of each, so counting it would double the pair count.
+        dropped_total += len(seen)
     if dropped_total:
         log.info("Dropped %d mutually conflicting priority pairs", dropped_total)
 
