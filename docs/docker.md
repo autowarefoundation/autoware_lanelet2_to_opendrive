@@ -45,6 +45,28 @@ docker compose --profile carla run --rm carla-import-test
 docker compose --profile dev run --rm dev
 ```
 
+### Running from a git worktree
+
+If `.` is a [`git worktree`](https://git-scm.com/docs/git-worktree) rather
+than the main checkout, its `.git` is a text file pointing at an absolute
+host path inside the *main* repository's `.git/worktrees/<name>` directory —
+a location outside the `.:/workspace` bind mount, so it's invisible to the
+container. `docker-compose.yml` mounts an extra volume at
+`${GIT_COMMON_DIR}` to make that path resolve; export it before running any
+compose command from a worktree:
+
+```bash
+export GIT_COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir)
+docker compose --profile lint run --rm lint
+```
+
+When `GIT_COMMON_DIR` is unset (the normal, non-worktree case) the volume
+falls back to a harmless empty directory and every command above works
+exactly as documented, with no extra step. The image also bakes in
+`git config --system --add safe.directory '*'` so that the bind-mounted
+`.git` (owned by the host UID) isn't rejected by git's "dubious ownership"
+check inside the container (which runs as root).
+
 The `dev` profile bind-mounts the repository root at `/workspace`, so source
 edits on the host are immediately visible inside the container. Two named
 volumes isolate state from the host:
@@ -106,10 +128,11 @@ too -- so read the reasons, not only the verdict.
 `@pytest.mark.xfail(strict=True)` is still checked as failing; `green` does
 not, so a leftover marker shows up as `XPASS(strict)`.
 
-Both clear the project's `addopts` (`-n auto --testmon`). testmon deselects
-tests it considers unaffected by the last change, which would turn a red into
-"nothing ran", and a single test does not need a pool of xdist workers. Pass
-`-n N` yourself to parallelise.
+Both clear `addopts` and disable pytest-testmon (`-p no:pytest-testmon`), so an
+`addopts` added to the project later, or a stray `--testmon`, cannot change
+what runs: testmon deselects tests it considers unaffected by the last change,
+which would turn a red into "nothing ran". Tests run serially; pass `-n N`
+yourself to parallelise.
 
 The tests run in a resident `tdd` compose service (`sleep infinity`, profile
 `tdd`), started on first use, so each run is a `docker compose exec` of a few
@@ -163,11 +186,9 @@ docker compose --profile <whatever> run --rm <service>
 
 ### Pre-commit fails with `Is it installed, and are you in a Git repository directory?`
 
-Hooks run inside a container that has `git` installed but cannot resolve the
-host's `.git` if you are working from a `git worktree`. The bind-mounted
-`.git` file inside a worktree points to a path under the parent repository
-that the container does not see. Run the lint profile from a regular checkout
-of the repository, or run pre-commit directly on the host.
+You are running from a `git worktree` without exporting `GIT_COMMON_DIR`
+first. See [Running from a git worktree](#running-from-a-git-worktree)
+above.
 
 ### `docker compose ... config` reports a YAML error
 

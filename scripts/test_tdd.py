@@ -4,9 +4,25 @@ The verdict is the whole point of the tool: a "red" that is really an import
 error, a skip, or zero collected tests must never be reported as red.
 """
 
+import importlib.util
+from pathlib import Path
+
 import pytest
 
-from tdd import build_pytest_command, judge, parse_junit
+# ``scripts/`` is deliberately not a package: tdd.py has to run as
+# ``python scripts/tdd.py`` on hosts that cannot build the workspace. Load it
+# by path, so the test does not depend on pytest's ``prepend`` import mode
+# putting this directory on ``sys.path``.
+_spec = importlib.util.spec_from_file_location(
+    "tdd", Path(__file__).with_name("tdd.py")
+)
+assert _spec is not None and _spec.loader is not None
+tdd = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(tdd)
+
+build_pytest_command = tdd.build_pytest_command
+judge = tdd.judge
+parse_junit = tdd.parse_junit
 
 # --- JUnit fixtures --------------------------------------------------------
 
@@ -147,7 +163,9 @@ def test_green_names_a_strict_xpass() -> None:
 def test_command_neutralises_project_addopts() -> None:
     cmd = build_pytest_command("green", ["t.py::test_x"], "/tmp/j.xml")
     assert cmd[:3] == ["pytest", "-o", "addopts="]
-    assert "no:testmon" in cmd
+    # pytest-testmon registers its plugin as "pytest-testmon", not "testmon";
+    # "-p no:testmon" disables nothing.
+    assert "no:pytest-testmon" in cmd
     assert "--junitxml=/tmp/j.xml" in cmd
     assert cmd[-1] == "t.py::test_x"
 
