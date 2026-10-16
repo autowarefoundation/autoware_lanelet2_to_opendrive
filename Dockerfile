@@ -43,6 +43,19 @@ FROM deps AS dev
 ENV PATH="/workspace/.venv/bin:${PATH}"
 CMD ["bash"]
 
+# deps-nocarla mirrors `deps` above but installs without the `carla` extra,
+# producing a venv that runs natively on the host architecture (no
+# linux/amd64 pin needed). The same non-determinism rationale documented in
+# the single `deps` stage comment above applies here as well.
+FROM base AS deps-nocarla
+COPY pyproject.toml uv.lock .python-version ./
+COPY autoware_lanelet2_to_opendrive/ autoware_lanelet2_to_opendrive/
+RUN uv sync --frozen --dev
+
+FROM deps-nocarla AS dev-nocarla
+ENV PATH="/workspace/.venv/bin:${PATH}"
+CMD ["bash"]
+
 FROM base AS convert
 COPY --from=deps /workspace /workspace
 ENV PATH="/workspace/.venv/bin:${PATH}"
