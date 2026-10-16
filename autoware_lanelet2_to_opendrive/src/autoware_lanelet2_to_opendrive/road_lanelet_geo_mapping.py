@@ -26,7 +26,13 @@ from tqdm import tqdm
 
 from .config import DEFAULT_CONFIG
 from .opendrive.enums import TrafficRule
-from .opendrive.geometry import Arc, GeometryBase, ParamPoly3, evaluate_plan_view_world
+from .opendrive.geometry import (
+    Arc,
+    GeometryBase,
+    ParamPoly3,
+    evaluate_plan_view_world,
+    param_for_offset,
+)
 from .util import CONVERTIBLE_LANELET_SUBTYPES, filter_lanelets_by_subtype
 
 if TYPE_CHECKING:
@@ -413,6 +419,9 @@ def _evaluate_geometry_world(geom: GeometryBase, p: float) -> tuple[float, float
     chords between their endpoints (#495).
     """
     if isinstance(geom, ParamPoly3):
+        # `p` arrives as travelled distance; map it through the geometry's
+        # declared pRange before evaluating the polynomial.
+        p = param_for_offset(geom, p)
         coeffs = (
             geom.aU,
             geom.bU,
