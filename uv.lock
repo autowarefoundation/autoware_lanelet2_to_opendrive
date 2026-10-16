@@ -10,6 +10,7 @@ members = [
 [manifest.dependency-groups]
 dev = [
     { name = "black", specifier = ">=25.11.0" },
+    { name = "filelock", specifier = ">=3.13.0" },
     { name = "lark", specifier = ">=1.3.1" },
     { name = "mike", specifier = ">=2.1.3" },
     { name = "mkdocs", specifier = ">=1.6.0" },
@@ -1504,6 +1505,7 @@ version = "0.19.3"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/b7/70/7d9e51989ca614ebecd9c78f5480fa27613f158aff8a864ba18c62f2c886/typesafe_carla_toolchain-0.19.3.tar.gz", hash = "sha256:64a79d6b368673f9dd3f2fc7eb17b8aae2cffbc2d29270f2abacc6160875f84d", size = 3640, upload-time = "2026-10-04T09:36:47.343Z" }
 wheels = [
+    { url = "https://files.pythonhosted.org/packages/d5/f0/3f022023ed769f3deba87af8f19ec52c8c6d10904f4721c92f2a4b5e20de/typesafe_carla_toolchain-0.19.3-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:2dd50621d9718246a09b6b9137ee96af2da04e9384b6ba71fe2cfa47f36f7384", size = 66043400, upload-time = "2026-10-10T18:25:58.563Z" },
     { url = "https://files.pythonhosted.org/packages/62/64/f4136d4b332e8fb90212f8b701d9ea64c0f6b0f21047d80e61b336effbd1/typesafe_carla_toolchain-0.19.3-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:8a65ac11f5ed9f9963b4a0fe788aa31effe18755b8a4cb3cbdc1de6a4b028e76", size = 72696151, upload-time = "2026-10-04T09:36:44.788Z" },
 ]
 
