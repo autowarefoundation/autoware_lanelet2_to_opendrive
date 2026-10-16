@@ -15,10 +15,11 @@ from ..util import (
     filter_regulatory_element_by_type,
 )
 from ..config import CoordinateOffset
-from ..conversion_config import TrafficLightConfig
+from ..conversion_config import SignalConfig, TrafficLightConfig
 
 if TYPE_CHECKING:
     from .road import Road
+    from .reference_line import ReferenceLine
 
 
 @dataclass
@@ -89,6 +90,8 @@ class SignalsAndControllers:
         junction_lanelet_ids: Optional[Set[int]] = None,
         traffic_light_config: Optional[TrafficLightConfig] = None,
         offset: CoordinateOffset = CoordinateOffset(),
+        signal_config: Optional[SignalConfig] = None,
+        routing_graph: Optional[RoutingGraph] = None,
     ) -> "SignalsAndControllers":
         """
         Construct signals and controllers from Lanelet2 map.
@@ -112,6 +115,11 @@ class SignalsAndControllers:
                   positionInertial coordinates.
             offset: Coordinate offset to subtract from extracted signal
                   coordinates. Defaults to a zero offset.
+            signal_config: Configuration for OpenDRIVE signal attributes.
+            routing_graph: Optional pre-built routing graph for the same
+                  ``lanelet_map``. Reused when supplied so the map-wide graph
+                  is not rebuilt for the signals phase; a fresh graph is built
+                  only when ``None``.
 
         Returns:
             SignalsAndControllers object with populated signals and controllers
@@ -125,10 +133,25 @@ class SignalsAndControllers:
                - If it affects multiple roads, create a Controller to synchronize them
         """
         result = SignalsAndControllers()
+        signal_country = (
+            signal_config.country if signal_config is not None else SignalConfig.country
+        )
 
-        # Build the map-wide routing graph once and reuse it for every
-        # signal's ReferenceLine construction (avoids ~1 rebuild per signal).
-        signal_routing_graph = create_routing_graph(lanelet_map)
+        # Reuse the caller's map-wide routing graph when supplied (the lanelet
+        # map is not mutated after ``Road.construct_from_lanelet_map``), and
+        # otherwise build one here so the graph is never rebuilt per signal.
+        signal_routing_graph = (
+            routing_graph
+            if routing_graph is not None
+            else create_routing_graph(lanelet_map)
+        )
+
+        # ReferenceLine is a pure function of (lanelet_map, road lanelets, offset,
+        # routing_graph), all of which are fixed for the duration of this
+        # call.  Several traffic lights typically land on the same road, so
+        # memoise the fit per road_id instead of re-running the B-spline
+        # solver once per (signal, road) pair.
+        reference_line_cache: Dict[int, "ReferenceLine"] = {}
 
         # Validate parameters
         if exclude_non_junction_signals and junction_lanelet_ids is None:
@@ -223,6 +246,7 @@ class SignalsAndControllers:
                     road=matching_road,
                     routing_graph=signal_routing_graph,
                     offset=offset,
+                    reference_line_cache=reference_line_cache,
                 )
 
                 # Calculate physical position from linestring centroid
@@ -256,6 +280,7 @@ class SignalsAndControllers:
                     road_elevation_at_s=road_elevation_at_s,
                     position_inertial=position_inertial,
                     offset=offset,
+                    country=signal_country,
                 )
 
                 result.add_signal(signal)
@@ -351,6 +376,7 @@ class SignalsAndControllers:
         road: Optional["Road"] = None,
         routing_graph: Optional[RoutingGraph] = None,
         offset: CoordinateOffset = CoordinateOffset(),
+        reference_line_cache: Optional[Dict[int, "ReferenceLine"]] = None,
     ) -> tuple[float, float]:
         """
         Calculate logical s,t coordinates for a traffic signal on a road.
@@ -372,6 +398,11 @@ class SignalsAndControllers:
                 per signal; a fresh graph is built only when None.
             offset: Coordinate offset to subtract from extracted signal
                 coordinates. Defaults to a zero offset.
+            reference_line_cache: Optional caller-owned ``road_id ->
+                ReferenceLine`` map used to share one reference-line fit
+                between every signal on the same road. Only successful fits
+                are cached, so a road whose fit raises behaves exactly as it
+                does without a cache (warning printed, fallback returned).
 
         Returns:
             Tuple of (s, t) coordinates where:
@@ -404,22 +435,38 @@ class SignalsAndControllers:
         if not lanelet_ids:
             return (0.0, -4.0)
 
-        # Get lanelet objects from IDs
-        lanelets = []
-        for lanelet_id in lanelet_ids:
-            try:
-                lanelet = lanelet_map.laneletLayer.get(lanelet_id)
-                lanelets.append(lanelet)
-            except Exception:
-                continue
+        # Reuse the reference line already fitted for this road, if the caller
+        # supplied a cache.  Every input to the fit (map, road lanelets,
+        # routing graph) is fixed for the lifetime of that cache.
+        reference_line: Optional["ReferenceLine"] = (
+            reference_line_cache.get(road_id)
+            if reference_line_cache is not None
+            else None
+        )
 
-        if not lanelets:
-            return (0.0, -4.0)
+        lanelets: List = []
+        if reference_line is None:
+            # Get lanelet objects from IDs
+            for lanelet_id in lanelet_ids:
+                try:
+                    lanelet = lanelet_map.laneletLayer.get(lanelet_id)
+                    lanelets.append(lanelet)
+                except Exception:
+                    continue
+
+            if not lanelets:
+                return (0.0, -4.0)
 
         try:
-            reference_line = ReferenceLine.construct_from_lanelet_groups(
-                lanelet_map, lanelets, routing_graph=routing_graph, offset=offset
-            )
+            if reference_line is None:
+                reference_line = ReferenceLine.construct_from_lanelet_groups(
+                    lanelet_map, lanelets, routing_graph=routing_graph, offset=offset
+                )
+                # Only successful fits are cached, so a road whose fit raises
+                # still warns and falls back once per signal — identical to
+                # the uncached path.
+                if reference_line_cache is not None:
+                    reference_line_cache[road_id] = reference_line
             spline = reference_line.centerline_2d
 
             s, _frenet_t = spline.cartesian_to_frenet(x, y, z)

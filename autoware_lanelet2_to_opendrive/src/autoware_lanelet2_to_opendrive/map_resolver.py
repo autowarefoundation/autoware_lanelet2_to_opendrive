@@ -1,7 +1,8 @@
 """Utilities for using converted maps directly in CARLA scenario tests.
 
 This module provides helpers that bridge the Lanelet2 → OpenDRIVE conversion
-pipeline with the ``autoware_carla_scenario`` testing framework.  The central
+pipeline with a CARLA scenario testing framework such as
+`autoware_carla_scenario <https://github.com/hakuturu583/autoware_carla_scenario>`_.  The central
 entry-point is :func:`resolve_map_to_xodr`, which accepts either an existing
 ``.xodr`` file or a Lanelet2 ``.osm`` file and returns a path to a ready-to-use
 OpenDRIVE file.  Lanelet2 maps are converted on first use and the result is
@@ -55,15 +56,11 @@ from typing import Optional
 import yaml
 
 from .conversion_config import ConversionConfig
+from .map_projector_info import MAP_PROJECTOR_INFO_FILENAME
 
 logger = logging.getLogger(__name__)
 
 _CACHE_DIR = Path("/tmp/autoware_lanelet2_to_opendrive_cache")
-
-#: Autoware ships this file next to the ``.osm`` map to declare the
-#: projector. Duplicated as a plain string (not imported from
-#: projection_resolver) to avoid pulling in its heavier dependencies here.
-_MAP_PROJECTOR_INFO_FILENAME = "map_projector_info.yaml"
 
 
 def _reject_unsupported_cache_path_projector(lanelet2_path: Path) -> None:
@@ -77,7 +74,7 @@ def _reject_unsupported_cache_path_projector(lanelet2_path: Path) -> None:
     which does honor ``map_projector_info.yaml``. Reads the YAML directly
     (rather than importing :mod:`.projection_resolver`) to avoid pulling in
     ``lanelet2``/``autoware_lanelet2_extension_python`` for this cheap, early
-    check.
+    check; :mod:`.map_projector_info` only needs PyYAML.
 
     Args:
         lanelet2_path: Path to the Lanelet2 ``.osm``/``.bin`` file.
@@ -85,8 +82,9 @@ def _reject_unsupported_cache_path_projector(lanelet2_path: Path) -> None:
     Raises:
         RuntimeError: If a sibling ``map_projector_info.yaml`` declares
             ``projector_type: TransverseMercator``.
+        ValueError: If the file's top-level YAML document is not a mapping.
     """
-    info_path = lanelet2_path.parent / _MAP_PROJECTOR_INFO_FILENAME
+    info_path = lanelet2_path.parent / MAP_PROJECTOR_INFO_FILENAME
     if not info_path.is_file():
         return
 
@@ -96,6 +94,8 @@ def _reject_unsupported_cache_path_projector(lanelet2_path: Path) -> None:
         # Malformed YAML is not this function's concern -- let the normal
         # conversion path surface the error.
         return
+    if not isinstance(data, dict):
+        raise ValueError(f"{info_path}: expected a YAML mapping at the top level")
 
     projector_type = str(data.get("projector_type", "")).strip()
     if projector_type == "TransverseMercator":

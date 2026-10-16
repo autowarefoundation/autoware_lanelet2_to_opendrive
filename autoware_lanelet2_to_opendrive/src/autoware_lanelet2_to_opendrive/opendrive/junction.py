@@ -8,9 +8,11 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Set
 import lxml.etree as ET
 import lanelet2
 
-from .enums import ContactPoint
+from .enums import ContactPoint, ElementType
 
 if TYPE_CHECKING:
+    from lanelet2.routing import RoutingGraph
+
     from .road import Road
 
 log = logging.getLogger(__name__)
@@ -136,11 +138,12 @@ def _build_priorities_from_records(
                 junction_priorities[jid].add(p)
                 sources[jid][p].append(record.re_id)
 
-    _warn_on_conflicts(junction_priorities, sources)
+    _drop_mutual_conflicts(junction_priorities, sources)
 
     return {
         jid: sorted(prio_set, key=lambda p: (p.high, p.low))
         for jid, prio_set in junction_priorities.items()
+        if prio_set
     }
 
 
@@ -173,30 +176,54 @@ def _resolve_lanelet_ids(
     return road_ids, next(iter(junction_ids)), unmapped
 
 
-def _warn_on_conflicts(
+def _drop_mutual_conflicts(
     junction_priorities: Dict[int, Set["Priority"]],
     sources: Dict[int, Dict["Priority", List[int]]],
 ) -> None:
-    """Log a WARNING for every (high, low) where its reverse also exists."""
-    seen: Set[tuple[int, int, int]] = set()  # (jid, min, max)
+    """Remove every (high, low) whose reverse also exists, in place.
+
+    ``<priority high low/>`` states a strict order, so emitting both
+    directions of a pair says "A outranks B and B outranks A" -- a statement
+    no reader can act on. Both directions are dropped rather than one,
+    because nothing in the input distinguishes them: Lanelet2's
+    ``right_of_way`` lists the lanelets to yield *to*, which two lanelets
+    separated by a signal phase legitimately do for each other. The order is
+    carried by the signal phase, not by a static rank, so the honest output
+    is no rank at all.
+
+    One-directional pairs are untouched: an unsignalled junction where only
+    one approach yields keeps its priority.
+
+    Measured on nishishinjuku: 324 of 884 pairs are mutual; on the Odaiba
+    map, 4,962 of 10,185, of which 4,942 sit at junctions carrying signals.
+    """
+    dropped_total = 0
     for jid, prio_set in junction_priorities.items():
-        for p in prio_set:
-            rev = Priority(high=p.low, low=p.high)
-            if rev not in prio_set:
-                continue
-            key = (jid, min(p.high, p.low), max(p.high, p.low))
+        mutual = {p for p in prio_set if Priority(high=p.low, low=p.high) in prio_set}
+        if not mutual:
+            continue
+        seen: Set[tuple[int, int]] = set()
+        for p in sorted(mutual, key=lambda q: (q.high, q.low)):
+            key = (min(p.high, p.low), max(p.high, p.low))
             if key in seen:
                 continue
             seen.add(key)
+            rev = Priority(high=p.low, low=p.high)
             log.warning(
                 "Conflicting priority %d<->%d in junction %d "
-                "(REs %s vs %s); both pairs emitted.",
+                "(REs %s vs %s); both directions dropped.",
                 p.high,
                 p.low,
                 jid,
                 sources[jid][p],
                 sources[jid][rev],
             )
+        prio_set -= mutual
+        # ``seen`` holds one entry per conflicting road pair; ``mutual`` holds
+        # both directions of each, so counting it would double the pair count.
+        dropped_total += len(seen)
+    if dropped_total:
+        log.info("Dropped %d mutually conflicting priority pairs", dropped_total)
 
 
 def _extract_right_of_way_records(
@@ -579,6 +606,8 @@ class Junction:
         lanelet_to_road_id: dict[int, int],
         connecting_road_ids: List[int],
         roads: Optional[List] = None,
+        routing_graph: Optional["RoutingGraph"] = None,
+        road_id_to_road: Optional[Dict[int, "Road"]] = None,
     ) -> List[Connection]:
         """Build junction connections from road topology.
 
@@ -595,6 +624,14 @@ class Junction:
             roads: Optional list of all Road objects for lane ID lookup.
                    Required to emit ``<laneLink>`` elements; when omitted
                    no connections are returned.
+            routing_graph: Optional pre-built vehicle routing graph. One is
+                   built from ``lanelet_map`` when omitted. Callers that
+                   invoke this once per junction should pass the graph they
+                   already hold — construction is whole-map work and would
+                   otherwise be repeated for every junction.
+            road_id_to_road: Optional pre-built ``road.id -> Road`` index over
+                   ``roads``. Derived from ``roads`` when omitted; pass it to
+                   avoid re-indexing the full road list per junction.
 
         Returns:
             List of Connection objects for this junction. Each Connection
@@ -602,22 +639,15 @@ class Junction:
             predecessor edge implied by the routing graph (#439: N:M
             lane links for multi-lane merges/splits).
         """
-        from lanelet2.routing import RoutingGraph, RoutingCostDistance
-        import lanelet2
+        # Create routing graph only when the caller has none to lend.
+        if routing_graph is None:
+            from ..util import create_routing_graph
 
-        # Create routing graph
-        traffic_rules = lanelet2.traffic_rules.create(
-            lanelet2.traffic_rules.Locations.Germany,
-            lanelet2.traffic_rules.Participants.Vehicle,
-        )
-        routing_graph = RoutingGraph(
-            lanelet_map, traffic_rules, [RoutingCostDistance(0.0)]
-        )
+            routing_graph = create_routing_graph(lanelet_map)
 
         # Build road_id to Road mapping for lane ID lookup
-        road_id_to_road: dict[int, "Road"] = {}
-        if roads is not None:
-            road_id_to_road = {road.id: road for road in roads}
+        if road_id_to_road is None:
+            road_id_to_road = {road.id: road for road in roads} if roads else {}
 
         # Walk the routing graph once and collect direct longitudinal
         # predecessor lanelet ids per connecting (junction) lanelet.  The
@@ -736,3 +766,55 @@ class Junction:
         if not result:
             log.info("No <priority> emitted (no valid right_of_way REs)")
         return result
+
+
+def junction_id_base(max_road_id: int, junction_id_offset: int) -> int:
+    """Return the first multiple of ``junction_id_offset`` above ``max_road_id``.
+
+    CARLA resolves road and junction IDs in one ID space, so junction IDs start
+    at ``junction_id_offset`` (issue #132). Once the highest road ID reaches the
+    offset they would coincide with road IDs, so they start at the next multiple
+    of the offset above the highest road ID instead (4739 -> 5000 at the default
+    offset of 1000).
+
+    Args:
+        max_road_id: Highest road ID in the map (-1 when there are no roads)
+        junction_id_offset: Configured start of the junction IDs (positive)
+
+    Returns:
+        First junction ID to use
+    """
+    if junction_id_offset <= 0:
+        raise ValueError(
+            f"junction_id_offset must be positive, got {junction_id_offset}"
+        )
+    return max(max_road_id // junction_id_offset + 1, 1) * junction_id_offset
+
+
+def shift_junction_ids(
+    junctions: Iterable[Junction], roads: Iterable["Road"], shift: int
+) -> None:
+    """Add ``shift`` to every junction ID and to every reference to one.
+
+    References are the ``junction`` attribute of connecting roads and the
+    road links of type ``junction``. The same shift for every junction keeps
+    the synthetic divergence/merge junctions (issue #291) in their band above
+    the others.
+
+    Args:
+        junctions: All junctions
+        roads: All roads (regular + connecting)
+        shift: Amount to add; 0 leaves everything unchanged
+    """
+    if shift == 0:
+        return
+    for junction in junctions:
+        junction.id += shift
+    for road in roads:
+        if road.junction != -1:
+            road.junction += shift
+        if road.link is None:
+            continue
+        for element in (road.link.predecessor, road.link.successor):
+            if element is not None and element.element_type == ElementType.JUNCTION:
+                element.element_id += shift

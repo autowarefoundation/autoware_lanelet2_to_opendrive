@@ -28,6 +28,12 @@ class GeometryConstants:
             ``type=curbstone`` or ``type=road_border``. Both ``inner`` and
             ``outer`` of the emitted ``<height>`` are set to this value, so
             the sidewalk surface sits flat on top of the curb. Issue #469.
+        nearest_road_rerank_ulps: Relative width, in units of float64
+            machine epsilon, of the band above the vectorised minimum distance
+            whose candidates the nearest-road index re-ranks with
+            ``math.hypot``. ``np.hypot`` (libm) and ``math.hypot`` (CPython)
+            may disagree by about one ulp, so every candidate that could be
+            the ``math.hypot`` minimum lies inside this band.
     """
 
     epsilon: float = 1e-10
@@ -36,6 +42,7 @@ class GeometryConstants:
     divergence_min_segment_length: float = 0.01
     divergence_default_lane_width: float = 3.5
     sidewalk_height: float = 0.15
+    nearest_road_rerank_ulps: float = 8.0
 
 
 @dataclass(frozen=True)
@@ -124,8 +131,9 @@ class OpenDriveConstants:
                            - Junction 0 becomes ID 1000
                            - Junction 1 becomes ID 1001
                            - etc.
-                           This ensures junction IDs never collide with road IDs
-                           even for large maps with hundreds of roads.
+                           Once the highest road ID reaches the offset, junction
+                           IDs start at the next multiple of the offset above it
+                           instead, so they never collide with road IDs.
     """
 
     junction_id_offset: int = 1000
@@ -206,6 +214,23 @@ class UtmConstants:
 
 
 @dataclass(frozen=True)
+class ProjectionConstants:
+    """Constants for resolving the map projection.
+
+    Attributes:
+        transverse_mercator_default_scale_factor: Central-meridian scale
+            factor (k0) used when a TransverseMercator
+            ``map_projector_info.yaml`` omits ``scale_factor``. Matches
+            Autoware's projector, which uses
+            ``GeographicLib::TransverseMercator::UTM()`` (k0 = 0.9996), and
+            the default of the pinned lanelet2 ``TransverseMercatorProjector``
+            binding. Dimensionless.
+    """
+
+    transverse_mercator_default_scale_factor: float = 0.9996
+
+
+@dataclass(frozen=True)
 class ConversionConstants:
     """Main container for all internal constants used in the conversion process.
 
@@ -247,6 +272,7 @@ class ConversionConstants:
         parampoly3: ParamPoly3 geometry generation constants
         arcspiral: Arc/spiral classifier internal tunables
         utm: Standard UTM projection constants
+        projection: Map projection resolution constants
     """
 
     geometry: GeometryConstants = GeometryConstants()
@@ -257,6 +283,7 @@ class ConversionConstants:
     parampoly3: ParamPoly3Constants = ParamPoly3Constants()
     arcspiral: ArcSpiralConstants = ArcSpiralConstants()
     utm: UtmConstants = UtmConstants()
+    projection: ProjectionConstants = ProjectionConstants()
 
 
 @dataclass(frozen=True)
