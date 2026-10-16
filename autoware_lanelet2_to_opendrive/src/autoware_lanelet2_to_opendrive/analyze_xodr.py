@@ -303,6 +303,65 @@ class ValidationContext:
     """``TrafficLightConfig`` restored from ``.mapping.json``, or ``None``."""
 
 
+@dataclass(frozen=True)
+class GeoReferenceFrame:
+    """Coordinate frame recovered from an XODR ``geoReference`` PROJ string."""
+
+    origin_lat: float
+    """Latitude (deg) of the frame origin, used to build the projector."""
+
+    origin_lon: float
+    """Longitude (deg) of the frame origin, used to build the projector."""
+
+    offset_x: float
+    """Offset (m) subtracted from projected OSM x to get XODR x."""
+
+    offset_y: float
+    """Offset (m) subtracted from projected OSM y to get XODR y."""
+
+
+def _frame_from_geo_reference(proj_string: str) -> GeoReferenceFrame | None:
+    """Recover the validation frame (origin + offset) from a geoReference.
+
+    The conversion mapping sidecar does not record the origin or offset, so
+    the frame is derived from the PROJ string:
+
+    * MGRS-grid-relative ``+proj=tmerc`` form (MGRS / MGRS+offset / lat_lon
+      origins since #550): ``+lat_0``/``+lon_0`` are the equator and the UTM
+      central meridian, and the origin is encoded in ``+x_0``/``+y_0``. The
+      offset is read from it exactly via
+      :func:`~.projection.parse_mgrs_frame_proj_string`.
+    * Anything else (TransverseMercator, pre-#550 ``+proj=utm`` strings):
+      ``+lat_0``/``+lon_0`` are the real origin, and the offset is that
+      origin's ``MGRSProjector`` output, as before.
+
+    Returns ``None`` if the string cannot be interpreted.
+    """
+    import lanelet2
+    from autoware_lanelet2_extension_python.projection import MGRSProjector
+
+    from .projection import latlon_to_lanelet2_origin, parse_mgrs_frame_proj_string
+
+    mgrs_frame = parse_mgrs_frame_proj_string(proj_string)
+    if mgrs_frame is not None:
+        return GeoReferenceFrame(
+            mgrs_frame.latitude,
+            mgrs_frame.longitude,
+            mgrs_frame.offset_x,
+            mgrs_frame.offset_y,
+        )
+
+    lat_match = re.search(r"\+lat_0=([\d.eE+-]+)", proj_string)
+    lon_match = re.search(r"\+lon_0=([\d.eE+-]+)", proj_string)
+    if not lat_match or not lon_match:
+        return None
+    origin_lat = float(lat_match.group(1))
+    origin_lon = float(lon_match.group(1))
+    projector = MGRSProjector(latlon_to_lanelet2_origin(origin_lat, origin_lon))
+    fwd = projector.forward(lanelet2.core.GPSPoint(origin_lat, origin_lon, 0.0))
+    return GeoReferenceFrame(origin_lat, origin_lon, fwd.x, fwd.y)
+
+
 def _load_validation_context(
     xodr_path: Path,
     osm_path: Path,
@@ -356,21 +415,14 @@ def _load_validation_context(
         print("  WARNING: No geoReference in XODR; skipping validation.")
         return None
 
-    proj_string = geo_ref_elem.text.strip()
-    lat_match = re.search(r"\+lat_0=([\d.eE+-]+)", proj_string)
-    lon_match = re.search(r"\+lon_0=([\d.eE+-]+)", proj_string)
-    if not lat_match or not lon_match:
+    frame = _frame_from_geo_reference(geo_ref_elem.text.strip())
+    if frame is None:
         print("  WARNING: Cannot parse lat_0/lon_0 from geoReference; skipping.")
         return None
 
-    origin_lat = float(lat_match.group(1))
-    origin_lon = float(lon_match.group(1))
-
-    origin = latlon_to_lanelet2_origin(origin_lat, origin_lon)
+    origin = latlon_to_lanelet2_origin(frame.origin_lat, frame.origin_lon)
     projector = MGRSProjector(origin)
     lanelet_map = lanelet2.io.load(str(effective_osm), projector)
-
-    fwd = projector.forward(lanelet2.core.GPSPoint(origin_lat, origin_lon, 0.0))
 
     # Restore TrafficLightConfig from the mapping sidecar (if saved)
     tl_config = None
@@ -387,8 +439,8 @@ def _load_validation_context(
 
     return ValidationContext(
         lanelet_map=lanelet_map,
-        offset_x=fwd.x,
-        offset_y=fwd.y,
+        offset_x=frame.offset_x,
+        offset_y=frame.offset_y,
         conv_mapping=conv_mapping,
         effective_osm=effective_osm,
         xodr_root=tree.getroot(),

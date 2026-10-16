@@ -17,6 +17,7 @@ from autoware_lanelet2_to_opendrive.conversion_config import OriginSpec
 from autoware_lanelet2_to_opendrive.projection import (
     latlon_to_proj_string,
     mgrs_grid_with_offset_to_latlon,
+    mgrs_grid_with_offset_to_proj_string,
     mgrs_to_proj_string,
 )
 from autoware_lanelet2_to_opendrive.projection_resolver import (
@@ -61,14 +62,22 @@ def test_resolve_mgrs_grid_with_offset():
     assert resolved.offset == (81655.73, 50137.43, 42.5)
     assert resolved.mgrs_offset == (81655.73, 50137.43)
 
+    # origin_lat/origin_lon go through mgrs_grid_with_offset_to_latlon, which
+    # truncates the offset to whole meters when round-tripping through a
+    # 10-digit MGRS string; they are unaffected by this fix and are only
+    # used to build the lanelet2 Origin (which MGRSProjector ignores when
+    # computing exported coordinates).
     expected_lat, expected_lon = mgrs_grid_with_offset_to_latlon(
         "54SUE", 81655.73, 50137.43
     )
     assert resolved.origin_lat == expected_lat
     assert resolved.origin_lon == expected_lon
 
-    # geoReference is derived from the offset-adjusted lat/lon.
-    assert resolved.geo_reference == latlon_to_proj_string(expected_lat, expected_lon)
+    # geoReference bypasses that truncation: it folds the full-precision
+    # offset directly into the grid square's UTM corner (issue #550).
+    assert resolved.geo_reference == mgrs_grid_with_offset_to_proj_string(
+        "54SUE", 81655.73, 50137.43
+    )
 
 
 def test_resolve_mgrs_grid_without_offset():
@@ -150,14 +159,23 @@ def test_resolve_rejects_offset_without_mgrs_grid():
 # ---------------------------------------------------------------------------
 
 
-def test_geo_reference_prefers_lat_lon():
-    spec = OriginSpec(mgrs_code="54SUE", lat=35.6895, lon=139.6917)
+def test_geo_reference_uses_lat_lon_without_mgrs_code():
+    spec = OriginSpec(lat=35.6895, lon=139.6917)
     assert geo_reference_for_origin(spec) == latlon_to_proj_string(35.6895, 139.6917)
 
 
-def test_geo_reference_falls_back_to_mgrs_code():
-    spec = OriginSpec(mgrs_code="54SUE")
+def test_geo_reference_prefers_mgrs_code():
+    # lat/lon here is the grid square's corner, which sits on a grid
+    # boundary; the mgrs_code is authoritative.
+    spec = OriginSpec(mgrs_code="54SUE", lat=35.6895, lon=139.6917)
     assert geo_reference_for_origin(spec) == mgrs_to_proj_string("54SUE")
+
+
+def test_geo_reference_folds_origin_spec_offset():
+    spec = OriginSpec(mgrs_code="54SUE", offset_x=81655.73, offset_y=50137.43)
+    assert geo_reference_for_origin(spec) == mgrs_grid_with_offset_to_proj_string(
+        "54SUE", 81655.73, 50137.43
+    )
 
 
 def test_geo_reference_requires_origin():

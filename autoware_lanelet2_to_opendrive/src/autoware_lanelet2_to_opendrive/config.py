@@ -253,6 +253,42 @@ class ArcSpiralConstants:
 
 
 @dataclass(frozen=True)
+class UtmConstants:
+    """Constants for standard UTM projection parameters.
+
+    Used to build the MGRS-grid-relative geoReference PROJ string (issue
+    #550): Autoware's ``MGRSProjector`` emits coordinates relative to the
+    south-west corner of the point's 100 km MGRS grid square
+    (``fmod(utm_easting, 1e5)`` / ``fmod(utm_northing, 1e5)``), which
+    ``+proj=utm`` cannot express -- it silently ignores ``+x_0``/``+y_0``
+    (and even ``+lat_0``/``+lon_0``) overrides. Building the projection
+    explicitly as ``+proj=tmerc`` with these standard UTM parameters plus a
+    grid-square-relative false easting/northing reproduces it exactly.
+
+    Attributes:
+        scale_factor: Central-meridian scale factor (k) for standard UTM.
+        false_easting: Standard UTM false easting (m).
+        false_northing_south: Standard UTM false northing for the southern
+            hemisphere (m); the northern hemisphere uses 0.
+        mgrs_grid_square_size: Side length (m) of an MGRS 100 km grid
+            square; ``MGRSProjector`` emits ``fmod(utm, size)``.
+        zone_width_deg: Width (deg) of a UTM longitude zone.
+        zone_count: Number of UTM longitude zones.
+        param_tolerance: Absolute tolerance used when matching parsed PROJ
+            parameters (``+lat_0``, ``+lon_0``, ``+k_0``) against the
+            standard UTM values above.
+    """
+
+    scale_factor: float = 0.9996
+    false_easting: float = 500_000.0
+    false_northing_south: float = 10_000_000.0
+    mgrs_grid_square_size: float = 100_000.0
+    zone_width_deg: float = 6.0
+    zone_count: int = 60
+    param_tolerance: float = 1e-9
+
+
+@dataclass(frozen=True)
 class ProjectionConstants:
     """Constants for resolving the map projection.
 
@@ -340,6 +376,7 @@ class ConversionConstants:
         opendrive: OpenDRIVE format constants
         parampoly3: ParamPoly3 geometry generation constants
         arcspiral: Arc/spiral classifier internal tunables
+        utm: Standard UTM projection constants
         projection: Map projection resolution constants
         geo_mapping: Geometric mapping cross-validation constants
     """
@@ -351,6 +388,7 @@ class ConversionConstants:
     opendrive: OpenDriveConstants = OpenDriveConstants()
     parampoly3: ParamPoly3Constants = ParamPoly3Constants()
     arcspiral: ArcSpiralConstants = ArcSpiralConstants()
+    utm: UtmConstants = UtmConstants()
     projection: ProjectionConstants = ProjectionConstants()
     geo_mapping: GeoMappingConstants = GeoMappingConstants()
 

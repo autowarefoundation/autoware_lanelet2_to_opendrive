@@ -1,10 +1,14 @@
 """Coordinate projection and MGRS conversion utilities."""
 
 import logging
+import math
 import re
+from dataclasses import dataclass
 
 import lanelet2
 import mgrs
+
+from .config import DEFAULT_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -40,27 +44,176 @@ def _normalize_mgrs_grid(mgrs_grid: str) -> str:
     return processed_mgrs
 
 
-def _build_utm_proj_string(
-    zone: int | str, lat: float, lon: float, is_south: bool
+def _mgrs_grid_square_utm(mgrs_grid: str) -> tuple[int, str, float, float]:
+    """Return the UTM zone, hemisphere and south-west corner of a 100 km square.
+
+    Any in-square digits (e.g. the ``1234567890`` of ``"54SUE1234567890"``)
+    are discarded: ``MGRSProjector`` emits coordinates relative to the grid
+    square's corner, never to a point inside it, so the frame must be
+    anchored there regardless of how precisely the grid was written.
+
+    Raises:
+        ValueError: If ``mgrs_grid`` does not start with a grid square ID.
+    """
+    match = re.match(r"^(\d+[A-Z]{3})", mgrs_grid.strip())
+    if not match:
+        raise ValueError(f"Invalid MGRS format: {mgrs_grid}")
+    zone, hemisphere, grid_easting, grid_northing = mgrs.MGRS().MGRSToUTM(
+        _normalize_mgrs_grid(match.group(1))
+    )
+    return zone, hemisphere, grid_easting, grid_northing
+
+
+def _utm_central_meridian(zone: int) -> float:
+    """Return the central meridian (decimal degrees) of a UTM zone."""
+    return (zone - 1) * 6 - 180 + 3
+
+
+@dataclass(frozen=True)
+class MgrsFrame:
+    """Frame origin encoded in an MGRS-grid-relative geoReference.
+
+    Inverse of :func:`_build_mgrs_frame_proj_string`: the PROJ string maps
+    the point ``(easting, northing)`` (standard UTM, zone ``zone``) to the
+    output origin ``(0, 0)``.
+
+    Attributes:
+        zone: UTM zone number.
+        is_south: True for the southern hemisphere.
+        easting: Standard UTM easting (m) of the frame origin.
+        northing: Standard UTM northing (m) of the frame origin.
+        offset_x: Frame origin relative to the SW corner of its 100 km grid
+            square, i.e. what ``MGRSProjector.forward()`` returns there and
+            the offset the converter subtracted from projected coordinates.
+        offset_y: Northing counterpart of ``offset_x``.
+        latitude: Latitude (deg) of the frame origin (1 m MGRS precision).
+        longitude: Longitude (deg) of the frame origin (1 m MGRS precision).
+    """
+
+    zone: int
+    is_south: bool
+    easting: float
+    northing: float
+    offset_x: float
+    offset_y: float
+    latitude: float
+    longitude: float
+
+
+def _parse_proj_params(proj_string: str) -> dict[str, str]:
+    """Parse ``+key=value`` (and bare ``+flag``) tokens of a PROJ string."""
+    params: dict[str, str] = {}
+    for token in proj_string.split():
+        if not token.startswith("+"):
+            continue
+        key, _, value = token[1:].partition("=")
+        params[key] = value
+    return params
+
+
+def parse_mgrs_frame_proj_string(proj_string: str) -> MgrsFrame | None:
+    """Recover the frame origin from an MGRS-grid-relative geoReference.
+
+    Recognises only the form emitted by :func:`_build_mgrs_frame_proj_string`
+    (``+proj=tmerc +lat_0=0 +lon_0=<UTM central meridian> +k_0=0.9996`` with
+    a non-zero ``+x_0``/``+y_0``). Its ``+lat_0``/``+lon_0`` are *not* the
+    map origin; the origin is the inverse projection of output ``(0, 0)``,
+    which for this form is simply the standard UTM point
+    ``(false_easting - x_0, false_northing - y_0)``.
+
+    Returns ``None`` for any other string -- e.g. a TransverseMercator
+    geoReference (``+x_0=0 +y_0=0``, real ``lat_0``/``lon_0``) or a pre-#550
+    ``+proj=utm`` string -- whose ``+lat_0``/``+lon_0`` are the real origin.
+    """
+    utm = DEFAULT_CONFIG.utm
+    params = _parse_proj_params(proj_string)
+    if params.get("proj") != "tmerc":
+        return None
+    try:
+        lat_0 = float(params["lat_0"])
+        lon_0 = float(params["lon_0"])
+        k_0 = float(params.get("k_0", params.get("k", "nan")))
+        x_0 = float(params["x_0"])
+        y_0 = float(params["y_0"])
+    except (KeyError, ValueError):
+        return None
+
+    tol = utm.param_tolerance
+    if abs(lat_0) > tol or abs(k_0 - utm.scale_factor) > tol:
+        return None
+    zone = round((lon_0 + 180.0 + utm.zone_width_deg / 2) / utm.zone_width_deg)
+    if not 1 <= zone <= utm.zone_count:
+        return None
+    if abs(_utm_central_meridian(zone) - lon_0) > tol:
+        return None
+    if x_0 == 0.0 and y_0 == 0.0:
+        # Also a valid TM frame centered on (0, lon_0); both readings agree.
+        return None
+
+    # The northern hemisphere has false northing 0, so y_0 = -northing <= 0;
+    # the southern one has y_0 = 10_000_000 - northing > 0.
+    is_south = y_0 > 0.0
+    false_northing = utm.false_northing_south if is_south else 0.0
+    easting = utm.false_easting - x_0
+    northing = false_northing - y_0
+
+    m = mgrs.MGRS()
+    mgrs_code = m.UTMToMGRS(zone, "S" if is_south else "N", easting, northing)
+    latitude, longitude = m.toLatLon(mgrs_code)
+
+    size = utm.mgrs_grid_square_size
+    return MgrsFrame(
+        zone=zone,
+        is_south=is_south,
+        easting=easting,
+        northing=northing,
+        offset_x=math.fmod(easting, size),
+        offset_y=math.fmod(northing, size),
+        latitude=latitude,
+        longitude=longitude,
+    )
+
+
+def _build_mgrs_frame_proj_string(
+    zone: int, is_south: bool, grid_easting: float, grid_northing: float
 ) -> str:
-    """Build a UTM PROJ string from zone, origin coordinates, and hemisphere.
+    """Build the PROJ string for the frame ``MGRSProjector`` actually emits.
+
+    Autoware's ``MGRSProjector::forward()`` ignores the projector's origin:
+    for every point it computes the standard UTM easting/northing and
+    returns ``fmod(easting, 1e5)`` / ``fmod(northing, 1e5)`` -- the offset
+    from the south-west corner of that point's 100 km MGRS grid square.
+    ``+proj=utm`` hardcodes its false easting/northing and silently ignores
+    any ``+x_0``/``+y_0``/``+lat_0``/``+lon_0`` override (verified
+    empirically against PROJ), so it cannot express this grid-relative
+    frame. Building the projection explicitly as ``+proj=tmerc`` with the
+    standard UTM scale factor and central meridian, and a false
+    easting/northing shifted by the grid square's south-west corner,
+    reproduces it exactly.
 
     Args:
-        zone: UTM zone number
-        lat: Origin latitude in decimal degrees
-        lon: Origin longitude in decimal degrees
-        is_south: True if the location is in the southern hemisphere
+        zone: UTM zone number.
+        is_south: True if the grid square is in the southern hemisphere.
+        grid_easting: Standard UTM easting (m) of the grid square's
+            south-west corner.
+        grid_northing: Standard UTM northing (m) of the grid square's
+            south-west corner.
 
     Returns:
-        PROJ string for UTM projection
+        PROJ string for the MGRS-grid-relative frame.
     """
-    hemisphere = "+south" if is_south else ""
-    proj_string = (
-        f"+proj=utm +zone={zone} {hemisphere} "
-        f"+lat_0={lat} +lon_0={lon} "
+    utm = DEFAULT_CONFIG.utm
+    false_northing = utm.false_northing_south if is_south else 0.0
+    # Round to micrometer precision to strip float-arithmetic repr artifacts
+    # (e.g. 118344.27000000002) while fully preserving the 0.01 m-granularity
+    # fractional offsets from issue #550.
+    x_0 = round(utm.false_easting - grid_easting, 6)
+    y_0 = round(false_northing - grid_northing, 6)
+    return (
+        f"+proj=tmerc +lat_0=0 +lon_0={_utm_central_meridian(zone)} "
+        f"+k_0={utm.scale_factor} +x_0={x_0} +y_0={y_0} "
         f"+datum=WGS84 +units=m +no_defs"
-    ).replace("  ", " ")  # Remove double spaces if hemisphere is empty
-    return proj_string
+    )
 
 
 def mgrs_to_lanelet2_origin(mgrs_grid: str) -> lanelet2.io.Origin:
@@ -207,41 +360,96 @@ def latlon_to_lanelet2_origin(
 def mgrs_to_proj_string(mgrs_grid: str) -> str:
     """Convert MGRS grid to PROJ string for OpenDRIVE geoReference.
 
+    Assumes the map's coordinates all fall within the single 100 km MGRS
+    grid square identified by ``mgrs_grid`` -- the same assumption
+    ``MGRSProjector`` itself relies on (it warns if a projected point lands
+    in a different grid square than the previous one).
+
     Args:
         mgrs_grid: MGRS grid reference string (e.g., "54SUE" or "54SUE1234567890")
 
     Returns:
-        PROJ string with UTM projection and origin coordinates from MGRS grid
+        PROJ string for the MGRS-grid-relative frame ``MGRSProjector``
+        actually emits (see :func:`_build_mgrs_frame_proj_string`).
 
     Raises:
         ValueError: If the MGRS grid string is invalid
 
     Example:
         >>> mgrs_to_proj_string("54SUE")
-        '+proj=utm +zone=54 +south +lat_0=-28.0 +lon_0=141.0 +datum=WGS84 +units=m +no_defs'
+        '+proj=tmerc +lat_0=0 +lon_0=141 +k_0=0.9996 +x_0=200000.0 +y_0=-3900000.0 +datum=WGS84 +units=m +no_defs'
     """
     try:
-        # Extract UTM zone number and latitude band
-        zone_match = re.match(r"^(\d+)([A-Z])", mgrs_grid)
-        if not zone_match:
-            raise ValueError(f"Invalid MGRS format: {mgrs_grid}")
+        zone, hemisphere, grid_easting, grid_northing = _mgrs_grid_square_utm(mgrs_grid)
 
-        zone = zone_match.group(1)
-        band = zone_match.group(2)
+        proj_string = _build_mgrs_frame_proj_string(
+            zone, hemisphere == "S", grid_easting, grid_northing
+        )
 
-        # Determine hemisphere from latitude band
-        # Latitude bands: C-M are south, N-X are north
-        is_south = band < "N"
+        logger.debug(
+            f"PROJ string from MGRS grid: mgrs_grid={mgrs_grid}, "
+            f"zone={zone}, hemisphere={hemisphere}, "
+            f"grid_easting={grid_easting}, grid_northing={grid_northing}, "
+            f"proj={proj_string}"
+        )
 
-        # Convert MGRS to latitude/longitude
-        processed_mgrs = _normalize_mgrs_grid(mgrs_grid)
-        m = mgrs.MGRS()
-        lat, lon = m.toLatLon(processed_mgrs)
-
-        return _build_utm_proj_string(zone, lat, lon, is_south)
+        return proj_string
 
     except Exception as e:
         raise ValueError(f"Invalid MGRS grid string '{mgrs_grid}': {e}") from e
+
+
+def mgrs_grid_with_offset_to_proj_string(
+    mgrs_grid: str, offset_x: float, offset_y: float
+) -> str:
+    """Convert an MGRS grid square + full-precision offset to a PROJ string.
+
+    Unlike :func:`mgrs_grid_with_offset_to_latlon`, this does not round-trip
+    the offset through a 10-digit MGRS string (which truncates it to whole
+    meters). Instead, the offset is folded directly into the grid square's
+    SW-corner UTM coordinates before building the ``+proj=tmerc`` frame, so
+    the resulting geoReference is exact for fractional-meter offsets such as
+    those in ``nishishinjuku.yaml`` (issue #550).
+
+    Args:
+        mgrs_grid: MGRS grid reference string (e.g., "54SUE" or "54SUE1234567890")
+        offset_x: Offset in meters (easting direction) from the grid square's
+            south-west corner.
+        offset_y: Offset in meters (northing direction) from the grid square's
+            south-west corner.
+
+    Returns:
+        PROJ string for the MGRS-grid-relative frame, shifted so the offset
+        point (not the grid square's own SW corner) sits at the frame's
+        origin -- matching the convention ``MGRSProjector`` itself emits.
+
+    Raises:
+        ValueError: If the MGRS grid string is invalid.
+    """
+    try:
+        zone, hemisphere, grid_easting, grid_northing = _mgrs_grid_square_utm(mgrs_grid)
+
+        proj_string = _build_mgrs_frame_proj_string(
+            zone,
+            hemisphere == "S",
+            grid_easting + offset_x,
+            grid_northing + offset_y,
+        )
+
+        logger.debug(
+            f"PROJ string from MGRS grid + offset: mgrs_grid={mgrs_grid}, "
+            f"offset_x={offset_x}, offset_y={offset_y}, "
+            f"zone={zone}, hemisphere={hemisphere}, "
+            f"grid_easting={grid_easting}, grid_northing={grid_northing}, "
+            f"proj={proj_string}"
+        )
+
+        return proj_string
+
+    except Exception as e:
+        raise ValueError(
+            f"Invalid MGRS grid string '{mgrs_grid}' or offset values: {e}"
+        ) from e
 
 
 def latlon_to_tmerc_proj_string(lat_0: float, lon_0: float, scale_factor: float) -> str:
@@ -262,10 +470,10 @@ def latlon_to_tmerc_proj_string(lat_0: float, lon_0: float, scale_factor: float)
 
     Example:
         >>> latlon_to_tmerc_proj_string(35.61739731, 139.7797546, 0.9996)
-        '+proj=tmerc +lat_0=35.61739731 +lon_0=139.7797546 +k=0.9996 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs'
+        '+proj=tmerc +lat_0=35.61739731 +lon_0=139.7797546 +k_0=0.9996 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs'
     """
     return (
-        f"+proj=tmerc +lat_0={lat_0} +lon_0={lon_0} +k={scale_factor} "
+        f"+proj=tmerc +lat_0={lat_0} +lon_0={lon_0} +k_0={scale_factor} "
         f"+x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
     )
 
@@ -273,28 +481,36 @@ def latlon_to_tmerc_proj_string(lat_0: float, lon_0: float, scale_factor: float)
 def latlon_to_proj_string(lat: float, lon: float) -> str:
     """Convert latitude/longitude to PROJ string for OpenDRIVE geoReference.
 
+    Both the ``mgrs_grid`` and ``lat_lon`` origin specifications resolve to
+    an ``MGRSProjector`` (see :meth:`.projection_resolver.ResolvedProjection.make_projector`),
+    which emits coordinates relative to the point's 100 km MGRS grid square
+    regardless of the configured origin. This function therefore derives the
+    grid square containing ``(lat, lon)`` and delegates to
+    :func:`mgrs_to_proj_string`, so a ``lat_lon`` origin and an equivalent
+    ``mgrs_grid`` origin in the same grid square produce an identical
+    geoReference. As with :func:`mgrs_to_proj_string`, this assumes the map's
+    coordinates all fall within that single 100 km grid square.
+
     Args:
         lat: Latitude in decimal degrees
         lon: Longitude in decimal degrees
 
     Returns:
-        PROJ string with UTM projection and the specified origin coordinates
+        PROJ string for the MGRS-grid-relative frame containing (lat, lon).
 
     Example:
         >>> latlon_to_proj_string(35.6895, 139.6917)
-        '+proj=utm +zone=54 +lat_0=35.6895 +lon_0=139.6917 +datum=WGS84 +units=m +no_defs'
+        '+proj=tmerc +lat_0=0 +lon_0=141 +k_0=0.9996 +x_0=200000.0 +y_0=-3900000.0 +datum=WGS84 +units=m +no_defs'
     """
-    # Calculate UTM zone from longitude
-    # UTM zones are 6 degrees wide, starting at -180
-    zone = int((lon + 180) / 6) + 1
+    m = mgrs.MGRS()
+    mgrs_code = m.toMGRS(lat, lon)
+    match = re.match(r"^(\d+[A-Z][A-Z][A-Z])", mgrs_code)
+    grid = match.group(1) if match else mgrs_code[:5]
 
-    # Determine hemisphere from latitude
-    is_south = lat < 0
-
-    proj_string = _build_utm_proj_string(zone, lat, lon, is_south)
+    proj_string = mgrs_to_proj_string(grid)
 
     logger.debug(
-        f"PROJ string from lat/lon: lat={lat}, lon={lon}, zone={zone}, proj={proj_string}"
+        f"PROJ string from lat/lon: lat={lat}, lon={lon}, grid={grid}, proj={proj_string}"
     )
 
     return proj_string

@@ -31,7 +31,7 @@ class OriginSpec:
 
     * ``mgrs_code`` only – the origin is the south-west corner of the MGRS
       grid square (e.g. ``"54SUE"``).  The geoReference PROJ string is
-      derived from the grid square's lat/lon.
+      derived from ``mgrs_code`` (with ``offset_x``/``offset_y`` folded in).
     * ``lat`` + ``lon`` – the origin is given directly as WGS84 decimal
       degrees.  Use this when an MGRS offset has been applied (the offset
       shifts the origin away from the grid square corner) or when a lat/lon
@@ -40,7 +40,9 @@ class OriginSpec:
     * ``mgrs_code`` + ``lat`` + ``lon`` – all three fields set. This occurs
       when an MGRS grid is specified together with an offset: the lat/lon
       hold the offset-adjusted position while ``mgrs_code`` retains the
-      grid zone for reference. The geoReference uses ``lat``/``lon``.
+      grid zone. The geoReference is still derived from ``mgrs_code``
+      (plus ``offset_x``/``offset_y``); ``lat``/``lon`` are only used for it
+      when ``mgrs_code`` is unset.
     * ``lat`` + ``lon`` + ``scale_factor`` + ``geo_reference`` – a
       TransverseMercator origin. ``geo_reference`` carries the
       already-resolved PROJ string through from
