@@ -26,7 +26,12 @@ from ..conversion_config import (
     ParamPoly3Config,
     WidthEstimationConfig,
 )
-from ..util import LaneletInput, filter_lanelets_by_subtype, to_lanelet_list
+from ..util import (
+    CONVERTIBLE_LANELET_SUBTYPES,
+    LaneletInput,
+    filter_lanelets_by_subtype,
+    to_lanelet_list,
+)
 from .elevation import ElevationProfile
 from .enums import ContactPoint, ElementType, RoadType, TrafficRule
 from .geometry import (
@@ -1289,17 +1294,7 @@ class Road:
         # graph treats them as different participant classes, so e.g. walkways
         # will not be grouped together with road lanelets here.
         road_lanelets = _filter_lanelets_outside_junction(
-            filter_lanelets_by_subtype(
-                all_lanelets,
-                [
-                    "road",
-                    "highway",
-                    "walkway",
-                    "pedestrian_lane",
-                    "road_shoulder",
-                    "bicycle_lane",
-                ],
-            )
+            filter_lanelets_by_subtype(all_lanelets, CONVERTIBLE_LANELET_SUBTYPES)
         )
 
         if not road_lanelets:
