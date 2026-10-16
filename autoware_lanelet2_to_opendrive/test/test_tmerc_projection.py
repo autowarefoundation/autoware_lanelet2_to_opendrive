@@ -233,6 +233,35 @@ def test_tm_missing_map_origin_raises(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 5a. Missing scale_factor -> defaults to UTM k0 = 0.9996
+# ---------------------------------------------------------------------------
+
+
+def test_tm_missing_scale_factor_defaults_to_utm_k0(tmp_path):
+    """A TM yaml without ``scale_factor`` resolves with ``k=0.9996``.
+
+    Real Autoware TransverseMercator yamls usually omit ``scale_factor``;
+    Autoware's projector uses ``GeographicLib::TransverseMercator::UTM()``
+    (k0 = 0.9996), so the converter must default to the same value.
+    """
+    osm = _write_projector_info(
+        tmp_path,
+        "projector_type: TransverseMercator\n"
+        "vertical_datum: WGS84\n"
+        "map_origin:\n"
+        f"  latitude: {EXPECTED_LAT}\n"
+        f"  longitude: {EXPECTED_LON}\n",
+    )
+    resolved = resolve_projection(_cfg(), osm)
+
+    assert resolved.projector_type == "TransverseMercator"
+    assert resolved.scale_factor == EXPECTED_SCALE_FACTOR
+    assert resolved.geo_reference == EXPECTED_GEO_REFERENCE
+    assert resolved.to_origin_spec().lat == EXPECTED_LAT
+    assert resolved.to_origin_spec().lon == EXPECTED_LON
+
+
+# ---------------------------------------------------------------------------
 # 5b. Invalid scale_factor (non-positive or non-finite) -> ValueError
 # ---------------------------------------------------------------------------
 
@@ -294,4 +323,18 @@ def test_map_resolver_rejects_tm_yaml(tmp_path):
         "scale_factor: 0.9996\n",
     )
     with pytest.raises(RuntimeError, match="TransverseMercator"):
+        _convert_lanelet2_to_xodr_cached(osm)
+
+
+@pytest.mark.parametrize(
+    "contents", ["- projector_type: TransverseMercator\n", "just a string\n"]
+)
+def test_map_resolver_non_mapping_yaml_raises_value_error(tmp_path, contents):
+    """A top-level non-mapping yaml fails with a clear ValueError."""
+    from autoware_lanelet2_to_opendrive.map_resolver import (
+        _convert_lanelet2_to_xodr_cached,
+    )
+
+    osm = _write_projector_info(tmp_path, contents)
+    with pytest.raises(ValueError, match="expected a YAML mapping"):
         _convert_lanelet2_to_xodr_cached(osm)
