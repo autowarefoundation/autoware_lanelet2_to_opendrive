@@ -8,7 +8,7 @@ on:
 jobs:
   workflow-yaml-check:
     name: Workflow YAML Syntax Check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +57,7 @@ jobs:
 
   end-of-file-fixer:
     name: Auto-fix End of File
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # This job pushes a fix-up commit back to the PR branch, so it can only run
     # when that branch lives in this repository. On a fork PR the checkout below
     # cannot resolve `github.head_ref` against this repository and the job fails
@@ -122,7 +122,7 @@ jobs:
 
   check-version-bump-label:
     name: Check Version Bump Label
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event_name == 'pull_request'
     steps:
       - name: Check for version bump label
