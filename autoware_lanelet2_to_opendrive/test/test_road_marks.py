@@ -1,7 +1,6 @@
 """Tests for Lanelet2 LineString -> OpenDRIVE RoadMark mapping (P0-3)."""
 
 import lxml.etree as ET
-import pytest
 
 from autoware_lanelet2_to_opendrive.opendrive.lane_section import LaneSection
 from autoware_lanelet2_to_opendrive.opendrive.lane_elements import (
@@ -146,7 +145,6 @@ def test_nishishinjuku_emits_non_default_roadmarks(nishishinjuku_xodr):
     )
 
 
-@pytest.mark.xfail(strict=True, reason="road marks are built from the inner boundary")
 def test_a_lanes_road_mark_describes_its_outer_boundary(lanelet_map):
     """Only the boundary between two lanes allows a change: the inner lane's mark
     says so, and the outer lane's, which describes the road's edge, does not."""

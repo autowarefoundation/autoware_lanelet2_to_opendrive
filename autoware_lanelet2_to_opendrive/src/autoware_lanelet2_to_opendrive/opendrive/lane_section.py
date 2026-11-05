@@ -226,13 +226,16 @@ class LaneSection:
         # Assign road marks by combining the boundary LineString attributes
         # with the routing-graph-derived lane-change permission.
         #
-        # In OpenDRIVE, the road mark on a lane describes its INNER (center-side) boundary:
-        #   RHT – lane -(i+1) road mark = boundary between lane -i and lane -(i+1)
-        #   LHT – lane +(i+1) road mark = boundary between lane +i and lane +(i+1)
+        # In OpenDRIVE, the road mark on a lane describes its OUTER boundary, the
+        # one away from the reference line (CARLA's Map::GetMarkRecord reads a
+        # lane's inner boundary from the next lane inwards):
+        #   RHT – lane -i road mark = boundary between lane -i and lane -(i+1)
+        #   LHT – lane +i road mark = boundary between lane +i and lane +(i+1)
+        # The reference line's own mark holds the boundary of the innermost lane.
         #
-        # The inner boundary LineString for lanelet i is:
-        #   RHT – leftBound  (shared with lanelet i-1 or with reference line)
-        #   LHT – rightBound (shared with lanelet i-1 or with reference line)
+        # The outer boundary LineString for lanelet i is:
+        #   RHT – rightBound (shared with lanelet i+1, or the road's edge)
+        #   LHT – leftBound  (shared with lanelet i+1, or the road's edge)
         # Its type/subtype/color/lane_change attributes drive the roadMark
         # type, weight, and colour via ``road_mark_from_linestring_attrs``.
         #
@@ -247,18 +250,18 @@ class LaneSection:
             lanelet_here = lanelets_ordered[i]
             if is_lht:
                 can_change = routing_graph.left(lanelet_here) is not None
-                inner_bound = lanelet_here.rightBound
+                outer_bound = lanelet_here.leftBound
             else:
                 can_change = routing_graph.right(lanelet_here) is not None
-                inner_bound = lanelet_here.leftBound
+                outer_bound = lanelet_here.rightBound
 
             # ``AttributeMap`` supports __contains__ and __getitem__ but not
             # ``.get``; convert to dict once and reuse for both the helper
             # call and the subtype lookup below.
-            inner_attrs = dict(inner_bound.attributes)
+            outer_attrs = dict(outer_bound.attributes)
             rm = road_mark_from_linestring_attrs(
                 s_offset=0.0,
-                attrs=inner_attrs,
+                attrs=outer_attrs,
                 is_lht=is_lht,
             )
 
@@ -275,7 +278,7 @@ class LaneSection:
             # mark to BROKEN to remain visually consistent with behaviour.
             if (
                 rm.type == RoadMarkType.SOLID
-                and not inner_attrs.get("subtype")
+                and not outer_attrs.get("subtype")
                 and can_change
             ):
                 rm.type = RoadMarkType.BROKEN

@@ -316,8 +316,8 @@ class Lane:
 
         # Road marks are assigned by LaneSection.construct_from_lanelet_groups
         # so that the routing-graph-derived laneChange permission can be
-        # combined with the LineString attributes of the actual inner
-        # boundary between neighbouring lanes. See
+        # combined with the LineString attributes of the lane's outer
+        # boundary. See
         # ``opendrive/lane_section.py`` for the emission site.
 
         # Extract speed limit from lanelet attributes
