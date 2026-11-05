@@ -1,7 +1,9 @@
 """Tests for Lanelet2 LineString -> OpenDRIVE RoadMark mapping (P0-3)."""
 
 import lxml.etree as ET
+import pytest
 
+from autoware_lanelet2_to_opendrive.opendrive.lane_section import LaneSection
 from autoware_lanelet2_to_opendrive.opendrive.lane_elements import (
     RoadMark,
     road_mark_from_linestring_attrs,
@@ -142,3 +144,35 @@ def test_nishishinjuku_emits_non_default_roadmarks(nishishinjuku_xodr):
         "expected heterogeneity in roadMark attributes "
         "(non-solid-white, laneChange, or weight) — helper not wired"
     )
+
+
+@pytest.mark.xfail(strict=True, reason="road marks are built from the inner boundary")
+def test_a_lanes_road_mark_describes_its_outer_boundary(lanelet_map):
+    """Only the boundary between two lanes allows a change: the inner lane's mark
+    says so, and the outer lane's, which describes the road's edge, does not."""
+    inner = lanelet_map.laneletLayer.get(3002093)
+    outer = lanelet_map.laneletLayer.get(3002094)
+    assert inner.rightBound.id == outer.leftBound.id
+    bounds = {
+        inner.leftBound: "no",
+        inner.rightBound: "yes",
+        outer.rightBound: "no",
+    }
+    saved = [(b, dict(b.attributes).get("lane_change")) for b in bounds]
+    try:
+        for bound, value in bounds.items():
+            bound.attributes["lane_change"] = value
+        section = LaneSection.construct_from_lanelet_groups(
+            lanelet_map, [outer, inner], s_offset=0.0
+        )
+    finally:
+        for bound, value in saved:
+            if value is None:
+                del bound.attributes["lane_change"]
+            else:
+                bound.attributes["lane_change"] = value
+    marks = {
+        lane_id: lane.road_marks[0].lane_change
+        for lane_id, lane in section.right_lanes.items()
+    }
+    assert marks == {-1: RoadMarkLaneChange.BOTH, -2: RoadMarkLaneChange.NONE}
