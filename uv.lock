@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = "==3.10.*"
 
 [manifest]
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "autoware-lanelet2-to-opendrive"
-version = "2.62.0"
+version = "2.62.1"
 source = { editable = "autoware_lanelet2_to_opendrive" }
 dependencies = [
     { name = "asam-qc-opendrive" },
